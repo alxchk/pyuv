@@ -124,7 +124,7 @@ class libuv_build_ext(build_ext):
     libuv_dir      = os.path.join('deps', 'libuv')
     libuv_repo     = 'https://github.com/libuv/libuv.git'
     libuv_branch   = 'v1.x'
-    libuv_revision = '4d0054145d19ac654976ddf9476756c67481ff2a'
+    libuv_revision = '5ecc97ee7d5724982d0bf605dcbb009a572110da'
     libuv_patches  = []
 
     user_options = build_ext.user_options
@@ -199,7 +199,7 @@ class libuv_build_ext(build_ext):
             else:
                 exec_process(['sh', 'autogen.sh'], cwd=self.libuv_dir, env=env, silent=not self.libuv_verbose_build)
                 exec_process(['./configure'], cwd=self.libuv_dir, env=env, silent=not self.libuv_verbose_build)
-                exec_process(['make'], cwd=self.libuv_dir, env=env, silent=not self.libuv_verbose_build)
+                exec_process(['gmake'], cwd=self.libuv_dir, env=env, silent=not self.libuv_verbose_build)
         if self.libuv_force_fetch:
             rmtree('deps')
         if not os.path.exists(self.libuv_dir):
@@ -219,7 +219,7 @@ class libuv_build_ext(build_ext):
                     rmtree(os.path.join(self.libuv_dir, 'Release'))
                 else:
                     if os.path.exists(os.path.join(self.libuv_dir, 'Makefile')):
-                        exec_process(['make', 'distclean'], cwd=self.libuv_dir)
+                        exec_process(['gmake', 'distclean'], cwd=self.libuv_dir)
             if not os.path.exists(self.libuv_lib):
                 log.info('libuv needs to be compiled.')
                 build_libuv()
