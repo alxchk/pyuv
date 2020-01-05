@@ -1,22 +1,31 @@
 language: python
 sudo: false
-matrix:
-    include:
-        - python: 2.7
-          env: TOX_ENV=py27
-        - python: 3.3
-          env: TOX_ENV=py33
-        - python: 3.4
-          env: TOX_ENV=py34
-        - python: 3.5
-          env: TOX_ENV=py35
-        - python: pypy
-          env: TOX_ENV=pypy
-        - python: pypy3
-          env: TOX_ENV=pypy3
+python:
+    - '2.7'
+    - '3.3'
+    - '3.4'
+    - '3.5'
+    - '3.6'
+    - '3.7-dev'
+    - 'pypy'
+    - 'pypy3'
+
+branches:
+  only:
+    - master
+    - v1.x
+
+cache: pip
 before_install:
     - source .travis/before_install.sh
 install:
+    - python --version
+    - pip --version
     - pip install tox
 script:
-    - tox -e $TOX_ENV
+    - tox -e py
+
+notifications:
+  email:
+    on_success: never
+    on_failure: change

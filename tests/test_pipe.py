@@ -2,7 +2,7 @@
 import sys
 import unittest
 
-from common import linesep, platform_skip, TestCase
+from common import linesep, platform_skip, platform_only, TestCase
 import pyuv
 
 if sys.platform == 'win32':
@@ -11,6 +11,7 @@ else:
     TEST_PIPE = 'test-pipe'
 
 BAD_PIPE = '/pipe/that/does/not/exist'
+ABSTRACT_PIPE = '\x00test-pipe'
 
 
 class PipeErrorTest(TestCase):
@@ -63,7 +64,7 @@ class PipeTest(PipeTestCase):
 
     def on_client_connection(self, client, error):
         self.assertEqual(error, None)
-        self.assertEqual(client.getpeername(), TEST_PIPE)
+        self.assertEqual(client.getpeername(), self.pipe_name)
         client.start_read(self.on_client_read)
 
     def on_client_read(self, client, data, error):
@@ -75,11 +76,23 @@ class PipeTest(PipeTestCase):
     def test_pipe1(self):
         self.server = pyuv.Pipe(self.loop)
         self.server.pending_instances(100)
-        self.server.bind(TEST_PIPE)
-        self.assertEqual(self.server.getsockname(), TEST_PIPE)
+        self.pipe_name = TEST_PIPE
+        self.server.bind(self.pipe_name)
+        self.assertEqual(self.server.getsockname(), self.pipe_name)
         self.server.listen(self.on_connection)
         self.client = pyuv.Pipe(self.loop)
-        self.client.connect(TEST_PIPE, self.on_client_connection)
+        self.client.connect(self.pipe_name, self.on_client_connection)
+        self.loop.run()
+
+    @platform_only(['linux'])
+    def test_pipe1_abstract(self):
+        self.server = pyuv.Pipe(self.loop)
+        self.pipe_name = ABSTRACT_PIPE
+        self.server.bind(self.pipe_name)
+        self.assertEqual(self.server.getsockname(), self.pipe_name)
+        self.server.listen(self.on_connection)
+        self.client = pyuv.Pipe(self.loop)
+        self.client.connect(self.pipe_name, self.on_client_connection)
         self.loop.run()
 
 
@@ -277,6 +290,22 @@ class PipeBytesBind(TestCase):
         p.bind(b'test-pipe')
         p.close()
         self.loop.run()
+
+
+class PipeTestIPC(TestCase):
+
+    def check_ipc(self, handle, ipc):
+        self.assertTrue(hasattr(handle, 'ipc'))
+        self.assertIsInstance(handle.ipc, bool)
+        self.assertEqual(handle.ipc, ipc)
+
+    def test_ipc_attr(self):
+        handle = pyuv.Pipe(self.loop)
+        self.check_ipc(handle, False)
+        handle = pyuv.Pipe(self.loop, False)
+        self.check_ipc(handle, False)
+        handle = pyuv.Pipe(self.loop, True)
+        self.check_ipc(handle, True)
 
 
 if __name__ == '__main__':
