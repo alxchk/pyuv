@@ -43,6 +43,10 @@
 #include <fcntl.h>
 #include <time.h>
 
+#ifndef O_CLOEXEC
+#define O_CLOEXEC 02000000
+#endif
+
 #define HAVE_IFADDRS_H 1
 
 #ifdef __UCLIBC__

@@ -166,6 +166,7 @@ int uv_getaddrinfo(uv_loop_t* loop,
                           hostname + strlen(hostname),
                           hostname_ascii,
                           hostname_ascii + sizeof(hostname_ascii));
+
     if (rc < 0)
       return rc;
     hostname = hostname_ascii;
@@ -175,12 +176,13 @@ int uv_getaddrinfo(uv_loop_t* loop,
   hostname_len = hostname ? strlen(hostname) + 1 : 0;
   service_len = service ? strlen(service) + 1 : 0;
   hints_len = hints ? sizeof(*hints) : 0;
-  buf = uv__malloc(hostname_len + service_len + hints_len);
 
+  buf = uv__malloc(hostname_len + service_len + hints_len);
   if (buf == NULL)
     return UV_ENOMEM;
 
   uv__req_init(loop, req, UV_GETADDRINFO);
+
   req->loop = loop;
   req->cb = cb;
   req->addrinfo = NULL;

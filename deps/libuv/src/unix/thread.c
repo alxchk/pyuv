@@ -708,7 +708,7 @@ int uv_cond_init(uv_cond_t* cond) {
   if (err)
     return UV__ERR(err);
 
-#if !(defined(__ANDROID_API__) && __ANDROID_API__ < 21)
+#if !(defined(__ANDROID_API__) && __ANDROID_API__ < 21) && !defined(__pthread_condattr_setclock__)
   err = pthread_condattr_setclock(&attr, CLOCK_MONOTONIC);
   if (err)
     goto error2;

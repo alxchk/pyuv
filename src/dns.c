@@ -158,7 +158,10 @@ Util_func_getaddrinfo(PyObject *obj, PyObject *args, PyObject *kwargs)
     service = Py_None;
     callback = Py_None;
 
-    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "O!O|OiiiiO:getaddrinfo", kwlist, &LoopType, &loop, &host, &service, &family, &socktype, &protocol, &flags, &callback)) {
+    if (!PyArg_ParseTupleAndKeywords(
+            args, kwargs, "O!O|OiiiiO:getaddrinfo", kwlist,
+            &LoopType, &loop, &host, &service, &family, &socktype,
+            &protocol, &flags, &callback)) {
         return NULL;
     }
 
@@ -221,6 +224,7 @@ Util_func_getaddrinfo(PyObject *obj, PyObject *args, PyObject *kwargs)
                          host_str,
                          service_str,
                          &hints);
+
     if (err < 0) {
         RAISE_UV_EXCEPTION(err, PyExc_UVError);
         goto error;
@@ -238,6 +242,7 @@ Util_func_getaddrinfo(PyObject *obj, PyObject *args, PyObject *kwargs)
             RAISE_UV_EXCEPTION(err, PyExc_UVError);
             return NULL;
         }
+
         return dns_result;
     } else {
         /* async */

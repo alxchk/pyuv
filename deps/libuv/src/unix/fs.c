@@ -217,7 +217,7 @@ static ssize_t uv__fs_futime(uv_fs_t* req) {
   ts[0].tv_nsec = (uint64_t)(req->atime * 1000000) % 1000000 * 1000;
   ts[1].tv_sec  = req->mtime;
   ts[1].tv_nsec = (uint64_t)(req->mtime * 1000000) % 1000000 * 1000;
-#if defined(__ANDROID_API__) && __ANDROID_API__ < 21
+#if (defined(__ANDROID_API__) && __ANDROID_API__ < 21) || !_POSIX_C_SOURCE < 200809L
   return utimensat(req->file, NULL, ts, 0);
 #else
   return futimens(req->file, ts);
@@ -969,10 +969,10 @@ static ssize_t uv__fs_sendfile(uv_fs_t* req) {
 
 
 static ssize_t uv__fs_utime(uv_fs_t* req) {
-#if defined(__linux__)                                                         \
+#if (defined(__linux__)                                                        \
     || defined(_AIX71)                                                         \
     || defined(__sun)                                                          \
-    || defined(__HAIKU__)
+    || defined(__HAIKU__)) && defined(AT_FDCWD)
   /* utimesat() has nanosecond resolution but we stick to microseconds
    * for the sake of consistency with other platforms.
    */
@@ -987,7 +987,8 @@ static ssize_t uv__fs_utime(uv_fs_t* req) {
     || defined(__FreeBSD__)                                                   \
     || defined(__FreeBSD_kernel__)                                            \
     || defined(__NetBSD__)                                                    \
-    || defined(__OpenBSD__)
+    || defined(__OpenBSD__)                                                   \
+    || defined(__linux__)
   struct timeval tv[2];
   tv[0].tv_sec  = req->atime;
   tv[0].tv_usec = (uint64_t)(req->atime * 1000000) % 1000000;
@@ -1307,7 +1308,11 @@ static int uv__fs_statx(int fd,
   if (no_statx)
     return UV_ENOSYS;
 
+#ifndef AT_FDCWD
+  dirfd = -100;
+#else
   dirfd = AT_FDCWD;
+#endif
   flags = 0; /* AT_STATX_SYNC_AS_STAT */
   mode = 0xFFF; /* STATX_BASIC_STATS + STATX_BTIME */
 
@@ -1317,7 +1322,11 @@ static int uv__fs_statx(int fd,
   }
 
   if (is_lstat)
+#ifndef AT_SYMLINK_NOFOLLOW
+    flags |= 0x100;
+#else
     flags |= AT_SYMLINK_NOFOLLOW;
+#endif
 
   rc = uv__statx(dirfd, path, flags, mode, &statxbuf);
 

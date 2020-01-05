@@ -1044,7 +1044,7 @@ int uv__dup2_cloexec(int oldfd, int newfd) {
   if (errno != EINVAL)
     return UV__ERR(errno);
   /* Fall through. */
-#elif defined(__linux__)
+#elif defined(__linux__) && defined(O_CLOEXEC)
   static int no_dup3;
   if (!no_dup3) {
     do

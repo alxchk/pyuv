@@ -144,6 +144,10 @@ class libuv_build_ext(build_ext):
         if sys.platform.startswith('linux'):
             self.compiler.add_library('dl')
             self.compiler.add_library('rt')
+
+            self.compiler.add_include_dir(
+                os.path.join(self.libuv_dir, 'compat', 'linux'))
+
         elif sys.platform == 'darwin':
             self.compiler.define_macro('_DARWIN_USE_64_BIT_INODE', 1)
             self.compiler.define_macro('_DARWIN_UNLIMITED_SELECT', 1)
