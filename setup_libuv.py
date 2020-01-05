@@ -11,6 +11,9 @@ SOURCES = [
     'deps/libuv/src/threadpool.c',
     'deps/libuv/src/uv-common.c',
     'deps/libuv/src/version.c',
+    'deps/libuv/src/strscpy.c',
+    'deps/libuv/src/timer.c',
+    'deps/libuv/src/idna.c',
 ]
 
 if sys.platform == 'win32':
@@ -36,7 +39,6 @@ if sys.platform == 'win32':
         'deps/libuv/src/win/stream.c',
         'deps/libuv/src/win/tcp.c',
         'deps/libuv/src/win/thread.c',
-        'deps/libuv/src/win/timer.c',
         'deps/libuv/src/win/tty.c',
         'deps/libuv/src/win/udp.c',
         'deps/libuv/src/win/util.c',
@@ -60,7 +62,6 @@ else:
         'deps/libuv/src/unix/stream.c',
         'deps/libuv/src/unix/tcp.c',
         'deps/libuv/src/unix/thread.c',
-        'deps/libuv/src/unix/timer.c',
         'deps/libuv/src/unix/tty.c',
         'deps/libuv/src/unix/udp.c',
     ]
@@ -74,7 +75,6 @@ if sys.platform.startswith('linux'):
         'deps/libuv/src/unix/procfs-exepath.c',
         'deps/libuv/src/unix/proctitle.c',
         'deps/libuv/src/unix/sysinfo-loadavg.c',
-        'deps/libuv/src/unix/sysinfo-memory.c',
     ]
 elif sys.platform == 'darwin':
     SOURCES += [

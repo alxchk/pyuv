@@ -47,8 +47,6 @@
 # define CP_INTR 4
 #endif
 
-static char *process_title;
-
 
 int uv__platform_loop_init(uv_loop_t* loop) {
   return uv__kqueue_init(loop);
@@ -65,11 +63,11 @@ int uv_exepath(char* buffer, size_t* size) {
   ssize_t abspath_size;
 
   if (buffer == NULL || size == NULL || *size == 0)
-    return -EINVAL;
+    return UV_EINVAL;
 
   abspath_size = readlink("/proc/curproc/file", abspath, sizeof(abspath));
   if (abspath_size < 0)
-    return -errno;
+    return UV__ERR(errno);
 
   assert(abspath_size > 0);
   *size -= 1;
@@ -89,7 +87,7 @@ int uv_exepath(char* buffer, size_t* size) {
   size_t abspath_size;
 
   if (buffer == NULL || size == NULL || *size == 0)
-    return -EINVAL;
+    return UV_EINVAL;
 
   mib[0] = CTL_KERN;
   mib[1] = KERN_PROC;
@@ -97,8 +95,8 @@ int uv_exepath(char* buffer, size_t* size) {
   mib[3] = -1;
 
   abspath_size = sizeof abspath;
-  if (sysctl(mib, 4, abspath, &abspath_size, NULL, 0))
-    return -errno;
+  if (sysctl(mib, ARRAY_SIZE(mib), abspath, &abspath_size, NULL, 0))
+    return UV__ERR(errno);
 
   assert(abspath_size > 0);
   abspath_size -= 1;
@@ -119,7 +117,7 @@ uint64_t uv_get_free_memory(void) {
   size_t size = sizeof(freecount);
 
   if (sysctlbyname("vm.stats.vm.v_free_count", &freecount, &size, NULL, 0))
-    return -errno;
+    return UV__ERR(errno);
 
   return (uint64_t) freecount * sysconf(_SC_PAGESIZE);
 
@@ -132,10 +130,15 @@ uint64_t uv_get_total_memory(void) {
 
   size_t size = sizeof(info);
 
-  if (sysctl(which, 2, &info, &size, NULL, 0))
-    return -errno;
+  if (sysctl(which, ARRAY_SIZE(which), &info, &size, NULL, 0))
+    return UV__ERR(errno);
 
   return (uint64_t) info;
+}
+
+
+uint64_t uv_get_constrained_memory(void) {
+  return 0;  /* Memory constraints are unknown. */
 }
 
 
@@ -144,63 +147,13 @@ void uv_loadavg(double avg[3]) {
   size_t size = sizeof(info);
   int which[] = {CTL_VM, VM_LOADAVG};
 
-  if (sysctl(which, 2, &info, &size, NULL, 0) < 0) return;
+  if (sysctl(which, ARRAY_SIZE(which), &info, &size, NULL, 0) < 0) return;
 
   avg[0] = (double) info.ldavg[0] / info.fscale;
   avg[1] = (double) info.ldavg[1] / info.fscale;
   avg[2] = (double) info.ldavg[2] / info.fscale;
 }
 
-
-char** uv_setup_args(int argc, char** argv) {
-  process_title = argc ? uv__strdup(argv[0]) : NULL;
-  return argv;
-}
-
-
-int uv_set_process_title(const char* title) {
-  int oid[4];
-
-  uv__free(process_title);
-  process_title = uv__strdup(title);
-
-  oid[0] = CTL_KERN;
-  oid[1] = KERN_PROC;
-  oid[2] = KERN_PROC_ARGS;
-  oid[3] = getpid();
-
-  sysctl(oid,
-         ARRAY_SIZE(oid),
-         NULL,
-         NULL,
-         process_title,
-         strlen(process_title) + 1);
-
-  return 0;
-}
-
-
-int uv_get_process_title(char* buffer, size_t size) {
-  size_t len;
-
-  if (buffer == NULL || size == 0)
-    return -EINVAL;
-
-  if (process_title) {
-    len = strlen(process_title) + 1;
-
-    if (size < len)
-      return -ENOBUFS;
-
-    memcpy(buffer, process_title, len);
-  } else {
-    len = 0;
-  }
-
-  buffer[len] = '\0';
-
-  return 0;
-}
 
 int uv_resident_set_memory(size_t* rss) {
   struct kinfo_proc kinfo;
@@ -215,8 +168,8 @@ int uv_resident_set_memory(size_t* rss) {
 
   kinfo_size = sizeof(kinfo);
 
-  if (sysctl(mib, 4, &kinfo, &kinfo_size, NULL, 0))
-    return -errno;
+  if (sysctl(mib, ARRAY_SIZE(mib), &kinfo, &kinfo_size, NULL, 0))
+    return UV__ERR(errno);
 
   page_size = getpagesize();
 
@@ -235,7 +188,7 @@ int uv_uptime(double* uptime) {
   struct timespec sp;
   r = clock_gettime(CLOCK_MONOTONIC, &sp);
   if (r)
-    return -errno;
+    return UV__ERR(errno);
 
   *uptime = sp.tv_sec;
   return 0;
@@ -249,6 +202,7 @@ int uv_cpu_info(uv_cpu_info_t** cpu_infos, int* count) {
   uv_cpu_info_t* cpu_info;
   const char* maxcpus_key;
   const char* cptimes_key;
+  const char* model_key;
   char model[512];
   long* cp_times;
   int numcpus;
@@ -267,25 +221,31 @@ int uv_cpu_info(uv_cpu_info_t** cpu_infos, int* count) {
   cptimes_key = "kern.cp_times";
 #endif
 
-  size = sizeof(model);
-  if (sysctlbyname("hw.model", &model, &size, NULL, 0))
+#if defined(__arm__) || defined(__aarch64__)
+  /* The key hw.model and hw.clockrate are not available on FreeBSD ARM. */
+  model_key = "hw.machine";
+  cpuspeed = 0;
+#else
+  model_key = "hw.model";
+
+  size = sizeof(cpuspeed);
+  if (sysctlbyname("hw.clockrate", &cpuspeed, &size, NULL, 0))
     return -errno;
+#endif
+
+  size = sizeof(model);
+  if (sysctlbyname(model_key, &model, &size, NULL, 0))
+    return UV__ERR(errno);
 
   size = sizeof(numcpus);
   if (sysctlbyname("hw.ncpu", &numcpus, &size, NULL, 0))
-    return -errno;
+    return UV__ERR(errno);
 
   *cpu_infos = uv__malloc(numcpus * sizeof(**cpu_infos));
   if (!(*cpu_infos))
-    return -ENOMEM;
+    return UV_ENOMEM;
 
   *count = numcpus;
-
-  size = sizeof(cpuspeed);
-  if (sysctlbyname("hw.clockrate", &cpuspeed, &size, NULL, 0)) {
-    uv__free(*cpu_infos);
-    return -errno;
-  }
 
   /* kern.cp_times on FreeBSD i386 gives an array up to maxcpus instead of
    * ncpu.
@@ -293,7 +253,7 @@ int uv_cpu_info(uv_cpu_info_t** cpu_infos, int* count) {
   size = sizeof(maxcpus);
   if (sysctlbyname(maxcpus_key, &maxcpus, &size, NULL, 0)) {
     uv__free(*cpu_infos);
-    return -errno;
+    return UV__ERR(errno);
   }
 
   size = maxcpus * CPUSTATES * sizeof(long);
@@ -301,13 +261,13 @@ int uv_cpu_info(uv_cpu_info_t** cpu_infos, int* count) {
   cp_times = uv__malloc(size);
   if (cp_times == NULL) {
     uv__free(*cpu_infos);
-    return -ENOMEM;
+    return UV_ENOMEM;
   }
 
   if (sysctlbyname(cptimes_key, cp_times, &size, NULL, 0)) {
     uv__free(cp_times);
     uv__free(*cpu_infos);
-    return -errno;
+    return UV__ERR(errno);
   }
 
   for (i = 0; i < numcpus; i++) {
@@ -327,15 +287,4 @@ int uv_cpu_info(uv_cpu_info_t** cpu_infos, int* count) {
 
   uv__free(cp_times);
   return 0;
-}
-
-
-void uv_free_cpu_info(uv_cpu_info_t* cpu_infos, int count) {
-  int i;
-
-  for (i = 0; i < count; i++) {
-    uv__free(cpu_infos[i].model);
-  }
-
-  uv__free(cpu_infos);
 }
