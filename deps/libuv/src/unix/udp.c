@@ -42,19 +42,6 @@
 
 #if !defined(IP_ADD_SOURCE_MEMBERSHIP)
 # define IP_ADD_SOURCE_MEMBERSHIP	39
-
-struct group_source_req {
-    uint32_t gsr_interface;
-    struct sockaddr_storage gsr_group;
-    struct sockaddr_storage gsr_source;
-};
-
-struct ip_mreq_source {
-  struct in_addr imr_multiaddr;
-  struct in_addr imr_interface;
-  struct in_addr imr_sourceaddr;
-};
-
 #endif
 
 #if !defined(IP_DROP_SOURCE_MEMBERSHIP)
@@ -68,6 +55,19 @@ struct ip_mreq_source {
 #if !defined(MCAST_LEAVE_SOURCE_GROUP)
 # define MCAST_LEAVE_SOURCE_GROUP 47
 #endif
+
+struct _compat_group_source_req {
+    uint32_t gsr_interface;
+    struct sockaddr_storage gsr_group;
+    struct sockaddr_storage gsr_source;
+};
+
+struct _compat_ip_mreq_source {
+  struct in_addr imr_multiaddr;
+  struct in_addr imr_interface;
+  struct in_addr imr_sourceaddr;
+};
+
 
 static void uv__udp_run_completed(uv_udp_t* handle);
 static void uv__udp_io(uv_loop_t* loop, uv__io_t* w, unsigned int revents);
@@ -687,7 +687,7 @@ static int uv__udp_set_source_membership4(uv_udp_t* handle,
                                           const char* interface_addr,
                                           const struct sockaddr_in* source_addr,
                                           uv_membership membership) {
-  struct ip_mreq_source mreq;
+  struct _compat_ip_mreq_source mreq;
   int optname;
   int err;
 
@@ -732,7 +732,7 @@ static int uv__udp_set_source_membership6(uv_udp_t* handle,
                                           const char* interface_addr,
                                           const struct sockaddr_in6* source_addr,
                                           uv_membership membership) {
-  struct group_source_req mreq;
+  struct _compat_group_source_req mreq;
   struct sockaddr_in6 addr6;
   int optname;
   int err;

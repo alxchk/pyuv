@@ -15,6 +15,10 @@
    License along with the GNU C Library; if not, see
    <http://www.gnu.org/licenses/>.  */
 
+#ifdef __ANDROID_API__
+#include_next <sys/epoll.h>
+#else
+
 #ifndef	_SYS_EPOLL_H
 #define	_SYS_EPOLL_H	1
 
@@ -136,3 +140,5 @@ extern int epoll_pwait (int __epfd, struct epoll_event *__events,
 __END_DECLS
 
 #endif /* sys/epoll.h */
+
+#endif /* __ANDROID_API__ */

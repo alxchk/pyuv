@@ -542,7 +542,7 @@ int uv__close_nocancel(int fd) {
 #endif
 #pragma GCC diagnostic pop
 #elif defined(__linux__)
-  return syscall(SYS_close, fd);
+  return syscall(__NR_close, fd);
 #else
   return close(fd);
 #endif
