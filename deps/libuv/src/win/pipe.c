@@ -723,7 +723,11 @@ void uv__pipe_interrupt_read(uv_pipe_t* handle) {
 
   if (!(handle->flags & UV_HANDLE_NON_OVERLAPPED_PIPE)) {
     /* Cancel asynchronous read. */
-    r = CancelIoEx(handle->handle, &handle->read_req.u.io.overlapped);
+    if (pCancelIoEx) {
+      r = pCancelIoEx(handle->handle, &handle->read_req.u.io.overlapped);
+    } else {
+      r = CancelIo(handle->handle);
+    }
     assert(r || GetLastError() == ERROR_NOT_FOUND);
 
   } else {
@@ -743,7 +747,7 @@ void uv__pipe_interrupt_read(uv_pipe_t* handle) {
       /* Spin until the thread has acknowledged (by setting the thread to
        * INVALID_HANDLE_VALUE) that it is past the point of blocking. */
       while (thread != INVALID_HANDLE_VALUE) {
-        r = CancelSynchronousIo(thread);
+        r = pCancelSynchronousIo(thread);
         assert(r || GetLastError() == ERROR_NOT_FOUND);
         SwitchToThread(); /* Yield thread. */
         thread = *thread_ptr;

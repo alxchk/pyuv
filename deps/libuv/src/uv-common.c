@@ -574,11 +574,7 @@ int uv_fs_event_getpath(uv_fs_event_t* handle, char* buffer, size_t* size) {
  * contained in a nested union/struct) so this function locates it.
 */
 static unsigned int* uv__get_nbufs(uv_fs_t* req) {
-#ifdef _WIN32
-  return &req->fs.info.nbufs;
-#else
   return &req->nbufs;
-#endif
 }
 
 /* uv_fs_scandir() uses the system allocator to allocate memory on non-Windows

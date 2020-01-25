@@ -253,24 +253,18 @@ typedef union {
     CRITICAL_SECTION waiters_count_lock;
     HANDLE signal_event;
     HANDLE broadcast_event;
-  } unused_; /* TODO: retained for ABI compatibility; remove me in v2.x. */
+  } fallback;
 } uv_cond_t;
 
 typedef union {
+  /* srwlock_ has type SRWLOCK, but not all toolchains define this type in */
+  /* windows.h. */
+  SRWLOCK srwlock_;
   struct {
+    uv_mutex_t read_mutex_;
+    uv_mutex_t write_mutex_;
     unsigned int num_readers_;
-    CRITICAL_SECTION num_readers_lock_;
-    HANDLE write_semaphore_;
-  } state_;
-  /* TODO: remove me in v2.x. */
-  struct {
-    SRWLOCK unused_;
-  } unused1_;
-  /* TODO: remove me in v2.x. */
-  struct {
-    uv_mutex_t unused1_;
-    uv_mutex_t unused2_;
-  } unused2_;
+  } fallback_;
 } uv_rwlock_t;
 
 typedef struct {
@@ -575,14 +569,10 @@ typedef struct {
 
 #define UV_GETADDRINFO_PRIVATE_FIELDS                                         \
   struct uv__work work_req;                                                   \
-  uv_getaddrinfo_cb getaddrinfo_cb;                                           \
-  void* alloc;                                                                \
-  WCHAR* node;                                                                \
-  WCHAR* service;                                                             \
-  /* The addrinfoW field is used to store a pointer to the hints, and    */   \
-  /* later on to store the result of GetAddrInfoW. The final result will */   \
-  /* be converted to struct addrinfo* and stored in the addrinfo field.  */   \
-  struct addrinfoW* addrinfow;                                                \
+  uv_getaddrinfo_cb cb;                                                       \
+  struct addrinfo* hints;                                                     \
+  char* hostname;                                                             \
+  char* service;                                                              \
   struct addrinfo* addrinfo;                                                  \
   int retcode;
 
@@ -613,7 +603,7 @@ typedef struct {
     /* TODO: remove me in 0.9. */                                             \
     WCHAR* pathw;                                                             \
     int fd;                                                                   \
-  } file;                                                                     \
+  };                                                                          \
   union {                                                                     \
     struct {                                                                  \
       int mode;                                                               \
@@ -624,12 +614,12 @@ typedef struct {
       uv_buf_t* bufs;                                                         \
       int64_t offset;                                                         \
       uv_buf_t bufsml[4];                                                     \
-    } info;                                                                   \
+    };                                                                        \
     struct {                                                                  \
       double atime;                                                           \
       double mtime;                                                           \
-    } time;                                                                   \
-  } fs;
+    };                                                                        \
+  };
 
 #define UV_WORK_PRIVATE_FIELDS                                                \
   struct uv__work work_req;

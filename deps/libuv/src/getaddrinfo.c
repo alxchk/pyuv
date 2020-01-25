@@ -21,22 +21,32 @@
 /* Expose glibc-specific EAI_* error codes. Needs to be defined before we
  * include any headers.
  */
+
 #ifndef _GNU_SOURCE
 # define _GNU_SOURCE
 #endif
 
+#ifdef WIN32
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#else
+
+/* EAI_* constants. */
+#include <netdb.h>
+#endif
+
 #include "uv.h"
-#include "internal.h"
+#ifdef WIN32
+#include "win/internal.h"
+#else
+#include "unix/internal.h"
+#endif
 #include "idna.h"
 
 #include <errno.h>
 #include <stddef.h> /* NULL */
 #include <stdlib.h>
 #include <string.h>
-#include <net/if.h> /* if_indextoname() */
-
-/* EAI_* constants. */
-#include <netdb.h>
 
 
 int uv__getaddrinfo_translate_error(int sys_err) {
@@ -225,33 +235,4 @@ int uv_getaddrinfo(uv_loop_t* loop,
 void uv_freeaddrinfo(struct addrinfo* ai) {
   if (ai)
     freeaddrinfo(ai);
-}
-
-
-int uv_if_indextoname(unsigned int ifindex, char* buffer, size_t* size) {
-  char ifname_buf[UV_IF_NAMESIZE];
-  size_t len;
-
-  if (buffer == NULL || size == NULL || *size == 0)
-    return UV_EINVAL;
-
-  if (if_indextoname(ifindex, ifname_buf) == NULL)
-    return UV__ERR(errno);
-
-  len = strnlen(ifname_buf, sizeof(ifname_buf));
-
-  if (*size <= len) {
-    *size = len + 1;
-    return UV_ENOBUFS;
-  }
-
-  memcpy(buffer, ifname_buf, len);
-  buffer[len] = '\0';
-  *size = len;
-
-  return 0;
-}
-
-int uv_if_indextoiid(unsigned int ifindex, char* buffer, size_t* size) {
-  return uv_if_indextoname(ifindex, buffer, size);
 }

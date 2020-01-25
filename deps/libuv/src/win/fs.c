@@ -21,6 +21,7 @@
 
 #include <assert.h>
 #include <stdlib.h>
+#include <malloc.h>
 #include <direct.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -34,7 +35,8 @@
 #include "internal.h"
 #include "req-inl.h"
 #include "handle-inl.h"
-#include "fs-fd-hash-inl.h"
+
+#include <wincrypt.h>
 
 
 #define UV_FS_FREE_PATHS         0x0002
@@ -42,30 +44,12 @@
 #define UV_FS_CLEANEDUP          0x0010
 
 
-#define INIT(subtype)                                                         \
-  do {                                                                        \
-    if (req == NULL)                                                          \
-      return UV_EINVAL;                                                       \
-    uv_fs_req_init(loop, req, subtype, cb);                                   \
-  }                                                                           \
-  while (0)
-
-#define POST                                                                  \
-  do {                                                                        \
-    if (cb != NULL) {                                                         \
-      uv__req_register(loop, req);                                            \
-      uv__work_submit(loop,                                                   \
-                      &req->work_req,                                         \
-                      UV__WORK_FAST_IO,                                       \
-                      uv__fs_work,                                            \
-                      uv__fs_done);                                           \
-      return 0;                                                               \
-    } else {                                                                  \
-      uv__fs_work(&req->work_req);                                            \
-      return req->result;                                                     \
-    }                                                                         \
-  }                                                                           \
-  while (0)
+#define QUEUE_FS_TP_JOB(loop, req)                                          \
+  do {                                                                      \
+    uv__req_register(loop, req);                                            \
+    uv__work_submit((loop), &(req)->work_req, UV__WORK_FAST_IO,             \
+                     uv__fs_work, uv__fs_done);                             \
+  } while (0)
 
 #define SET_REQ_RESULT(req, result_value)                                   \
   do {                                                                      \
@@ -95,17 +79,14 @@
     return;                                                                 \
   }
 
-#define MILLIONu (1000U * 1000U)
-#define BILLIONu (1000U * 1000U * 1000U)
-
 #define FILETIME_TO_UINT(filetime)                                          \
-   (*((uint64_t*) &(filetime)) - (uint64_t) 116444736 * BILLIONu)
+   (*((uint64_t*) &(filetime)) - 116444736000000000ULL)
 
 #define FILETIME_TO_TIME_T(filetime)                                        \
-   (FILETIME_TO_UINT(filetime) / (10u * MILLIONu))
+   (FILETIME_TO_UINT(filetime) / 10000000ULL)
 
 #define FILETIME_TO_TIME_NS(filetime, secs)                                 \
-   ((FILETIME_TO_UINT(filetime) - (secs * (uint64_t) 10 * MILLIONu)) * 100U)
+   ((FILETIME_TO_UINT(filetime) - (secs * 10000000ULL)) * 100)
 
 #define FILETIME_TO_TIMESPEC(ts, filetime)                                  \
    do {                                                                     \
@@ -115,8 +96,8 @@
 
 #define TIME_T_TO_FILETIME(time, filetime_ptr)                              \
   do {                                                                      \
-    uint64_t bigtime = ((uint64_t) ((time) * (uint64_t) 10 * MILLIONu)) +   \
-                       (uint64_t) 116444736 * BILLIONu;                     \
+    uint64_t bigtime = ((int64_t) (time) * 10000000LL) +                    \
+                                  116444736000000000ULL;                    \
     (filetime_ptr)->dwLowDateTime = bigtime & 0xFFFFFFFF;                   \
     (filetime_ptr)->dwHighDateTime = bigtime >> 32;                         \
   } while(0)
@@ -125,37 +106,23 @@
 #define IS_LETTER(c) (((c) >= L'a' && (c) <= L'z') || \
   ((c) >= L'A' && (c) <= L'Z'))
 
-#define MIN(a,b) (((a) < (b)) ? (a) : (b))
-
 const WCHAR JUNCTION_PREFIX[] = L"\\??\\";
 const WCHAR JUNCTION_PREFIX_LEN = 4;
 
 const WCHAR LONG_PATH_PREFIX[] = L"\\\\?\\";
 const WCHAR LONG_PATH_PREFIX_LEN = 4;
 
-const WCHAR UNC_PATH_PREFIX[] = L"\\\\?\\UNC\\";
-const WCHAR UNC_PATH_PREFIX_LEN = 8;
 
-static int uv__file_symlink_usermode_flag = SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE;
-
-static DWORD uv__allocation_granularity;
-
-
-void uv_fs_init(void) {
-  SYSTEM_INFO system_info;
-
-  GetSystemInfo(&system_info);
-  uv__allocation_granularity = system_info.dwAllocationGranularity;
-
-  uv__fd_hash_init();
+void uv_fs_init() {
+  _fmode = _O_BINARY;
 }
 
 
-INLINE static int fs__capture_path(uv_fs_t* req, const char* path,
-    const char* new_path, const int copy_path) {
+INLINE static int fs__capture_path(uv_loop_t* loop, uv_fs_t* req,
+    const char* path, const char* new_path, const int copy_path) {
   char* buf;
   char* pos;
-  ssize_t buf_sz = 0, path_len = 0, pathw_len = 0, new_pathw_len = 0;
+  ssize_t buf_sz = 0, path_len, pathw_len = 0, new_pathw_len = 0;
 
   /* new_path can only be set if path is also set. */
   assert(new_path == NULL || path != NULL);
@@ -195,13 +162,13 @@ INLINE static int fs__capture_path(uv_fs_t* req, const char* path,
 
 
   if (buf_sz == 0) {
-    req->file.pathw = NULL;
-    req->fs.info.new_pathw = NULL;
+    req->pathw = NULL;
+    req->new_pathw = NULL;
     req->path = NULL;
     return 0;
   }
 
-  buf = (char*) uv__malloc(buf_sz);
+  buf = (char*) malloc(buf_sz);
   if (buf == NULL) {
     return ERROR_OUTOFMEMORY;
   }
@@ -216,10 +183,10 @@ INLINE static int fs__capture_path(uv_fs_t* req, const char* path,
                                   (WCHAR*) pos,
                                   pathw_len);
     assert(r == (DWORD) pathw_len);
-    req->file.pathw = (WCHAR*) pos;
+    req->pathw = (WCHAR*) pos;
     pos += r * sizeof(WCHAR);
   } else {
-    req->file.pathw = NULL;
+    req->pathw = NULL;
   }
 
   if (new_path != NULL) {
@@ -230,17 +197,20 @@ INLINE static int fs__capture_path(uv_fs_t* req, const char* path,
                                   (WCHAR*) pos,
                                   new_pathw_len);
     assert(r == (DWORD) new_pathw_len);
-    req->fs.info.new_pathw = (WCHAR*) pos;
+    req->new_pathw = (WCHAR*) pos;
     pos += r * sizeof(WCHAR);
   } else {
-    req->fs.info.new_pathw = NULL;
+    req->new_pathw = NULL;
   }
 
-  req->path = path;
-  if (path != NULL && copy_path) {
+  if (!copy_path) {
+    req->path = path;
+  } else if (path) {
     memcpy(pos, path, path_len);
     assert(path_len == buf_sz - (pos - buf));
     req->path = pos;
+  } else {
+    req->path = NULL;
   }
 
   req->flags |= UV_FS_FREE_PATHS;
@@ -252,8 +222,11 @@ INLINE static int fs__capture_path(uv_fs_t* req, const char* path,
 
 INLINE static void uv_fs_req_init(uv_loop_t* loop, uv_fs_t* req,
     uv_fs_type fs_type, const uv_fs_cb cb) {
+
   uv__once_init();
   UV_REQ_INIT(req, UV_FS);
+
+  req->type = UV_FS;
   req->loop = loop;
   req->flags = 0;
   req->fs_type = fs_type;
@@ -261,56 +234,6 @@ INLINE static void uv_fs_req_init(uv_loop_t* loop, uv_fs_t* req,
   req->ptr = NULL;
   req->path = NULL;
   req->cb = cb;
-  memset(&req->fs, 0, sizeof(req->fs));
-}
-
-
-static int fs__wide_to_utf8(WCHAR* w_source_ptr,
-                               DWORD w_source_len,
-                               char** target_ptr,
-                               uint64_t* target_len_ptr) {
-  int r;
-  int target_len;
-  char* target;
-  target_len = WideCharToMultiByte(CP_UTF8,
-                                   0,
-                                   w_source_ptr,
-                                   w_source_len,
-                                   NULL,
-                                   0,
-                                   NULL,
-                                   NULL);
-
-  if (target_len == 0) {
-    return -1;
-  }
-
-  if (target_len_ptr != NULL) {
-    *target_len_ptr = target_len;
-  }
-
-  if (target_ptr == NULL) {
-    return 0;
-  }
-
-  target = uv__malloc(target_len + 1);
-  if (target == NULL) {
-    SetLastError(ERROR_OUTOFMEMORY);
-    return -1;
-  }
-
-  r = WideCharToMultiByte(CP_UTF8,
-                          0,
-                          w_source_ptr,
-                          w_source_len,
-                          target,
-                          target_len,
-                          NULL,
-                          NULL);
-  assert(r == target_len);
-  target[target_len] = '\0';
-  *target_ptr = target;
-  return 0;
 }
 
 
@@ -318,8 +241,10 @@ INLINE static int fs__readlink_handle(HANDLE handle, char** target_ptr,
     uint64_t* target_len_ptr) {
   char buffer[MAXIMUM_REPARSE_DATA_BUFFER_SIZE];
   REPARSE_DATA_BUFFER* reparse_data = (REPARSE_DATA_BUFFER*) buffer;
-  WCHAR* w_target;
+  WCHAR *w_target;
   DWORD w_target_len;
+  char* target;
+  int target_len;
   DWORD bytes;
 
   if (!DeviceIoControl(handle,
@@ -342,11 +267,12 @@ INLINE static int fs__readlink_handle(HANDLE handle, char** target_ptr,
         reparse_data->SymbolicLinkReparseBuffer.SubstituteNameLength /
         sizeof(WCHAR);
 
-    /* Real symlinks can contain pretty much everything, but the only thing we
-     * really care about is undoing the implicit conversion to an NT namespaced
-     * path that CreateSymbolicLink will perform on absolute paths. If the path
-     * is win32-namespaced then the user must have explicitly made it so, and
-     * we better just return the unmodified reparse data. */
+    /* Real symlinks can contain pretty much everything, but the only thing */
+    /* we really care about is undoing the implicit conversion to an NT */
+    /* namespaced path that CreateSymbolicLink will perform on absolute */
+    /* paths. If the path is win32-namespaced then the user must have */
+    /* explicitly made it so, and we better just return the unmodified */
+    /* reparse data. */
     if (w_target_len >= 4 &&
         w_target[0] == L'\\' &&
         w_target[1] == L'?' &&
@@ -367,8 +293,8 @@ INLINE static int fs__readlink_handle(HANDLE handle, char** target_ptr,
                  (w_target[5] == L'N' || w_target[5] == L'n') &&
                  (w_target[6] == L'C' || w_target[6] == L'c') &&
                  w_target[7] == L'\\') {
-        /* \??\UNC\<server>\<share>\ - make sure the final path looks like
-         * \\<server>\<share>\ */
+        /* \??\UNC\<server>\<share>\ - make sure the final path looks like */
+        /* \\<server>\<share>\ */
         w_target += 6;
         w_target[0] = L'\\';
         w_target_len -= 6;
@@ -383,11 +309,11 @@ INLINE static int fs__readlink_handle(HANDLE handle, char** target_ptr,
     w_target_len = reparse_data->MountPointReparseBuffer.SubstituteNameLength /
         sizeof(WCHAR);
 
-    /* Only treat junctions that look like \??\<drive>:\ as symlink. Junctions
-     * can also be used as mount points, like \??\Volume{<guid>}, but that's
-     * confusing for programs since they wouldn't be able to actually
-     * understand such a path when returned by uv_readlink(). UNC paths are
-     * never valid for junctions so we don't care about them. */
+    /* Only treat junctions that look like \??\<drive>:\ as symlink. */
+    /* Junctions can also be used as mount points, like \??\Volume{<guid>}, */
+    /* but that's confusing for programs since they wouldn't be able to */
+    /* actually understand such a path when returned by uv_readlink(). */
+    /* UNC paths are never valid for junctions so we don't care about them. */
     if (!(w_target_len >= 6 &&
           w_target[0] == L'\\' &&
           w_target[1] == L'?' &&
@@ -411,7 +337,50 @@ INLINE static int fs__readlink_handle(HANDLE handle, char** target_ptr,
     return -1;
   }
 
-  return fs__wide_to_utf8(w_target, w_target_len, target_ptr, target_len_ptr);
+  /* If needed, compute the length of the target. */
+  if (target_ptr != NULL || target_len_ptr != NULL) {
+    /* Compute the length of the target. */
+    target_len = WideCharToMultiByte(CP_UTF8,
+                                     0,
+                                     w_target,
+                                     w_target_len,
+                                     NULL,
+                                     0,
+                                     NULL,
+                                     NULL);
+    if (target_len == 0) {
+      return -1;
+    }
+  }
+
+  /* If requested, allocate memory and convert to UTF8. */
+  if (target_ptr != NULL) {
+    int r;
+    target = (char*) malloc(target_len + 1);
+    if (target == NULL) {
+      SetLastError(ERROR_OUTOFMEMORY);
+      return -1;
+    }
+
+    r = WideCharToMultiByte(CP_UTF8,
+                            0,
+                            w_target,
+                            w_target_len,
+                            target,
+                            target_len,
+                            NULL,
+                            NULL);
+    assert(r == target_len);
+    target[target_len] = '\0';
+
+    *target_ptr = target;
+  }
+
+  if (target_len_ptr != NULL) {
+    *target_len_ptr = target_len;
+  }
+
+  return 0;
 }
 
 
@@ -422,87 +391,60 @@ void fs__open(uv_fs_t* req) {
   DWORD attributes = 0;
   HANDLE file;
   int fd, current_umask;
-  int flags = req->fs.info.file_flags;
-  struct uv__fd_info_s fd_info;
+  int flags = req->file_flags;
 
-  /* Adjust flags to be compatible with the memory file mapping. Save the
-   * original flags to emulate the correct behavior. */
-  if (flags & UV_FS_O_FILEMAP) {
-    fd_info.flags = flags;
-    fd_info.current_pos.QuadPart = 0;
-
-    if ((flags & (UV_FS_O_RDONLY | UV_FS_O_WRONLY | UV_FS_O_RDWR)) ==
-        UV_FS_O_WRONLY) {
-      /* CreateFileMapping always needs read access */
-      flags = (flags & ~UV_FS_O_WRONLY) | UV_FS_O_RDWR;
-    }
-
-    if (flags & UV_FS_O_APPEND) {
-      /* Clear the append flag and ensure RDRW mode */
-      flags &= ~UV_FS_O_APPEND;
-      flags &= ~(UV_FS_O_RDONLY | UV_FS_O_WRONLY | UV_FS_O_RDWR);
-      flags |= UV_FS_O_RDWR;
-    }
-  }
-
-  /* Obtain the active umask. umask() never fails and returns the previous
-   * umask. */
+  /* Obtain the active umask. umask() never fails and returns the previous */
+  /* umask. */
   current_umask = umask(0);
   umask(current_umask);
 
   /* convert flags and mode to CreateFile parameters */
-  switch (flags & (UV_FS_O_RDONLY | UV_FS_O_WRONLY | UV_FS_O_RDWR)) {
-  case UV_FS_O_RDONLY:
+  switch (flags & (_O_RDONLY | _O_WRONLY | _O_RDWR)) {
+  case _O_RDONLY:
     access = FILE_GENERIC_READ;
+    attributes |= FILE_FLAG_BACKUP_SEMANTICS;
     break;
-  case UV_FS_O_WRONLY:
+  case _O_WRONLY:
     access = FILE_GENERIC_WRITE;
     break;
-  case UV_FS_O_RDWR:
+  case _O_RDWR:
     access = FILE_GENERIC_READ | FILE_GENERIC_WRITE;
     break;
   default:
     goto einval;
   }
 
-  if (flags & UV_FS_O_APPEND) {
+  if (flags & _O_APPEND) {
     access &= ~FILE_WRITE_DATA;
     access |= FILE_APPEND_DATA;
+    attributes &= ~FILE_FLAG_BACKUP_SEMANTICS;
   }
 
   /*
    * Here is where we deviate significantly from what CRT's _open()
    * does. We indiscriminately use all the sharing modes, to match
    * UNIX semantics. In particular, this ensures that the file can
-   * be deleted even whilst it's open, fixing issue
-   * https://github.com/nodejs/node-v0.x-archive/issues/1449.
-   * We still support exclusive sharing mode, since it is necessary
-   * for opening raw block devices, otherwise Windows will prevent
-   * any attempt to write past the master boot record.
+   * be deleted even whilst it's open, fixing issue #1449.
    */
-  if (flags & UV_FS_O_EXLOCK) {
-    share = 0;
-  } else {
-    share = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
-  }
+  share = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
 
-  switch (flags & (UV_FS_O_CREAT | UV_FS_O_EXCL | UV_FS_O_TRUNC)) {
+  switch (flags & (_O_CREAT | _O_EXCL | _O_TRUNC)) {
   case 0:
-  case UV_FS_O_EXCL:
+  case _O_EXCL:
     disposition = OPEN_EXISTING;
     break;
-  case UV_FS_O_CREAT:
+  case _O_CREAT:
     disposition = OPEN_ALWAYS;
     break;
-  case UV_FS_O_CREAT | UV_FS_O_EXCL:
-  case UV_FS_O_CREAT | UV_FS_O_TRUNC | UV_FS_O_EXCL:
+  case _O_CREAT | _O_EXCL:
+  case _O_CREAT | _O_TRUNC | _O_EXCL:
     disposition = CREATE_NEW;
     break;
-  case UV_FS_O_TRUNC:
-  case UV_FS_O_TRUNC | UV_FS_O_EXCL:
+  case _O_TRUNC:
+  case _O_TRUNC | _O_EXCL:
     disposition = TRUNCATE_EXISTING;
     break;
-  case UV_FS_O_CREAT | UV_FS_O_TRUNC:
+  case _O_CREAT | _O_TRUNC:
     disposition = CREATE_ALWAYS;
     break;
   default:
@@ -510,71 +452,29 @@ void fs__open(uv_fs_t* req) {
   }
 
   attributes |= FILE_ATTRIBUTE_NORMAL;
-  if (flags & UV_FS_O_CREAT) {
-    if (!((req->fs.info.mode & ~current_umask) & _S_IWRITE)) {
+  if (flags & _O_CREAT) {
+    if (!((req->mode & ~current_umask) & _S_IWRITE)) {
       attributes |= FILE_ATTRIBUTE_READONLY;
     }
   }
 
-  if (flags & UV_FS_O_TEMPORARY ) {
+  if (flags & _O_TEMPORARY ) {
     attributes |= FILE_FLAG_DELETE_ON_CLOSE | FILE_ATTRIBUTE_TEMPORARY;
     access |= DELETE;
   }
 
-  if (flags & UV_FS_O_SHORT_LIVED) {
+  if (flags & _O_SHORT_LIVED) {
     attributes |= FILE_ATTRIBUTE_TEMPORARY;
   }
 
-  switch (flags & (UV_FS_O_SEQUENTIAL | UV_FS_O_RANDOM)) {
+  switch (flags & (_O_SEQUENTIAL | _O_RANDOM)) {
   case 0:
     break;
-  case UV_FS_O_SEQUENTIAL:
+  case _O_SEQUENTIAL:
     attributes |= FILE_FLAG_SEQUENTIAL_SCAN;
     break;
-  case UV_FS_O_RANDOM:
+  case _O_RANDOM:
     attributes |= FILE_FLAG_RANDOM_ACCESS;
-    break;
-  default:
-    goto einval;
-  }
-
-  if (flags & UV_FS_O_DIRECT) {
-    /*
-     * FILE_APPEND_DATA and FILE_FLAG_NO_BUFFERING are mutually exclusive.
-     * Windows returns 87, ERROR_INVALID_PARAMETER if these are combined.
-     *
-     * FILE_APPEND_DATA is included in FILE_GENERIC_WRITE:
-     *
-     * FILE_GENERIC_WRITE = STANDARD_RIGHTS_WRITE |
-     *                      FILE_WRITE_DATA |
-     *                      FILE_WRITE_ATTRIBUTES |
-     *                      FILE_WRITE_EA |
-     *                      FILE_APPEND_DATA |
-     *                      SYNCHRONIZE
-     *
-     * Note: Appends are also permitted by FILE_WRITE_DATA.
-     *
-     * In order for direct writes and direct appends to succeed, we therefore
-     * exclude FILE_APPEND_DATA if FILE_WRITE_DATA is specified, and otherwise
-     * fail if the user's sole permission is a direct append, since this
-     * particular combination is invalid.
-     */
-    if (access & FILE_APPEND_DATA) {
-      if (access & FILE_WRITE_DATA) {
-        access &= ~FILE_APPEND_DATA;
-      } else {
-        goto einval;
-      }
-    }
-    attributes |= FILE_FLAG_NO_BUFFERING;
-  }
-
-  switch (flags & (UV_FS_O_DSYNC | UV_FS_O_SYNC)) {
-  case 0:
-    break;
-  case UV_FS_O_DSYNC:
-  case UV_FS_O_SYNC:
-    attributes |= FILE_FLAG_WRITE_THROUGH;
     break;
   default:
     goto einval;
@@ -583,7 +483,7 @@ void fs__open(uv_fs_t* req) {
   /* Setting this flag makes it possible to open a directory. */
   attributes |= FILE_FLAG_BACKUP_SEMANTICS;
 
-  file = CreateFileW(req->file.pathw,
+  file = CreateFileW(req->pathw,
                      access,
                      share,
                      NULL,
@@ -592,10 +492,10 @@ void fs__open(uv_fs_t* req) {
                      NULL);
   if (file == INVALID_HANDLE_VALUE) {
     DWORD error = GetLastError();
-    if (error == ERROR_FILE_EXISTS && (flags & UV_FS_O_CREAT) &&
-        !(flags & UV_FS_O_EXCL)) {
-      /* Special case: when ERROR_FILE_EXISTS happens and UV_FS_O_CREAT was
-       * specified, it means the path referred to a directory. */
+    if (error == ERROR_FILE_EXISTS && (flags & _O_CREAT) &&
+        !(flags & _O_EXCL)) {
+      /* Special case: when ERROR_FILE_EXISTS happens and O_CREAT was */
+      /* specified, it means the path referred to a directory. */
       SET_REQ_UV_ERROR(req, UV_EISDIR, error);
     } else {
       SET_REQ_WIN32_ERROR(req, GetLastError());
@@ -614,53 +514,8 @@ void fs__open(uv_fs_t* req) {
     else if (GetLastError() != ERROR_SUCCESS)
       SET_REQ_WIN32_ERROR(req, GetLastError());
     else
-      SET_REQ_WIN32_ERROR(req, (DWORD) UV_UNKNOWN);
-    CloseHandle(file);
+      SET_REQ_WIN32_ERROR(req, UV_UNKNOWN);
     return;
-  }
-
-  if (flags & UV_FS_O_FILEMAP) {
-    FILE_STANDARD_INFO file_info;
-    if (!GetFileInformationByHandleEx(file,
-                                      FileStandardInfo,
-                                      &file_info,
-                                      sizeof file_info)) {
-      SET_REQ_WIN32_ERROR(req, GetLastError());
-      CloseHandle(file);
-      return;
-    }
-    fd_info.is_directory = file_info.Directory;
-
-    if (fd_info.is_directory) {
-      fd_info.size.QuadPart = 0;
-      fd_info.mapping = INVALID_HANDLE_VALUE;
-    } else {
-      if (!GetFileSizeEx(file, &fd_info.size)) {
-        SET_REQ_WIN32_ERROR(req, GetLastError());
-        CloseHandle(file);
-        return;
-      }
-
-      if (fd_info.size.QuadPart == 0) {
-        fd_info.mapping = INVALID_HANDLE_VALUE;
-      } else {
-        DWORD flProtect = (fd_info.flags & (UV_FS_O_RDONLY | UV_FS_O_WRONLY |
-          UV_FS_O_RDWR)) == UV_FS_O_RDONLY ? PAGE_READONLY : PAGE_READWRITE;
-        fd_info.mapping = CreateFileMapping(file,
-                                            NULL,
-                                            flProtect,
-                                            fd_info.size.HighPart,
-                                            fd_info.size.LowPart,
-                                            NULL);
-        if (fd_info.mapping == NULL) {
-          SET_REQ_WIN32_ERROR(req, GetLastError());
-          CloseHandle(file);
-          return;
-        }
-      }
-    }
-
-    uv__fd_hash_add(fd, &fd_info);
   }
 
   SET_REQ_RESULT(req, fd);
@@ -671,155 +526,19 @@ void fs__open(uv_fs_t* req) {
 }
 
 void fs__close(uv_fs_t* req) {
-  int fd = req->file.fd;
+  int fd = req->fd;
   int result;
-  struct uv__fd_info_s fd_info;
 
   VERIFY_FD(fd, req);
 
-  if (uv__fd_hash_remove(fd, &fd_info)) {
-    if (fd_info.mapping != INVALID_HANDLE_VALUE) {
-      CloseHandle(fd_info.mapping);
-    }
-  }
-
-  if (fd > 2)
-    result = _close(fd);
-  else
-    result = 0;
-
-  /* _close doesn't set _doserrno on failure, but it does always set errno
-   * to EBADF on failure.
-   */
-  if (result == -1) {
-    assert(errno == EBADF);
-    SET_REQ_UV_ERROR(req, UV_EBADF, ERROR_INVALID_HANDLE);
-  } else {
-    req->result = 0;
-  }
+  result = _close(fd);
+  SET_REQ_RESULT(req, result);
 }
 
-
-LONG fs__filemap_ex_filter(LONG excode, PEXCEPTION_POINTERS pep,
-                           int* perror) {
-  if (excode != EXCEPTION_IN_PAGE_ERROR) {
-    return EXCEPTION_CONTINUE_SEARCH;
-  }
-
-  assert(perror != NULL);
-  if (pep != NULL && pep->ExceptionRecord != NULL &&
-      pep->ExceptionRecord->NumberParameters >= 3) {
-    NTSTATUS status = (NTSTATUS)pep->ExceptionRecord->ExceptionInformation[3];
-    *perror = pRtlNtStatusToDosError(status);
-    if (*perror != ERROR_SUCCESS) {
-      return EXCEPTION_EXECUTE_HANDLER;
-    }
-  }
-  *perror = UV_UNKNOWN;
-  return EXCEPTION_EXECUTE_HANDLER;
-}
-
-
-void fs__read_filemap(uv_fs_t* req, struct uv__fd_info_s* fd_info) {
-  int fd = req->file.fd; /* VERIFY_FD done in fs__read */
-  int rw_flags = fd_info->flags &
-    (UV_FS_O_RDONLY | UV_FS_O_WRONLY | UV_FS_O_RDWR);
-  size_t read_size, done_read;
-  unsigned int index;
-  LARGE_INTEGER pos, end_pos;
-  size_t view_offset;
-  LARGE_INTEGER view_base;
-  void* view;
-
-  if (rw_flags == UV_FS_O_WRONLY) {
-    SET_REQ_WIN32_ERROR(req, ERROR_ACCESS_DENIED);
-    return;
-  }
-  if (fd_info->is_directory) {
-    SET_REQ_WIN32_ERROR(req, ERROR_INVALID_FUNCTION);
-    return;
-  }
-
-  if (req->fs.info.offset == -1) {
-    pos = fd_info->current_pos;
-  } else {
-    pos.QuadPart = req->fs.info.offset;
-  }
-
-  /* Make sure we wont read past EOF. */
-  if (pos.QuadPart >= fd_info->size.QuadPart) {
-    SET_REQ_RESULT(req, 0);
-    return;
-  }
-
-  read_size = 0;
-  for (index = 0; index < req->fs.info.nbufs; ++index) {
-    read_size += req->fs.info.bufs[index].len;
-  }
-  read_size = (size_t) MIN((LONGLONG) read_size,
-                           fd_info->size.QuadPart - pos.QuadPart);
-  if (read_size == 0) {
-    SET_REQ_RESULT(req, 0);
-    return;
-  }
-
-  end_pos.QuadPart = pos.QuadPart + read_size;
-
-  view_offset = pos.QuadPart % uv__allocation_granularity;
-  view_base.QuadPart = pos.QuadPart - view_offset;
-  view = MapViewOfFile(fd_info->mapping,
-                       FILE_MAP_READ,
-                       view_base.HighPart,
-                       view_base.LowPart,
-                       view_offset + read_size);
-  if (view == NULL) {
-    SET_REQ_WIN32_ERROR(req, GetLastError());
-    return;
-  }
-
-  done_read = 0;
-  for (index = 0;
-       index < req->fs.info.nbufs && done_read < read_size;
-       ++index) {
-    int err = 0;
-    size_t this_read_size = MIN(req->fs.info.bufs[index].len,
-                                read_size - done_read);
-#ifdef _MSC_VER
-    __try {
-#endif
-      memcpy(req->fs.info.bufs[index].base,
-             (char*)view + view_offset + done_read,
-             this_read_size);
-#ifdef _MSC_VER
-    }
-    __except (fs__filemap_ex_filter(GetExceptionCode(),
-                                    GetExceptionInformation(), &err)) {
-      SET_REQ_WIN32_ERROR(req, err);
-      UnmapViewOfFile(view);
-      return;
-    }
-#endif
-    done_read += this_read_size;
-  }
-  assert(done_read == read_size);
-
-  if (!UnmapViewOfFile(view)) {
-    SET_REQ_WIN32_ERROR(req, GetLastError());
-    return;
-  }
-
-  if (req->fs.info.offset == -1) {
-    fd_info->current_pos = end_pos;
-    uv__fd_hash_add(fd, fd_info);
-  }
-
-  SET_REQ_RESULT(req, read_size);
-  return;
-}
 
 void fs__read(uv_fs_t* req) {
-  int fd = req->file.fd;
-  int64_t offset = req->fs.info.offset;
+  int fd = req->fd;
+  int64_t offset = req->offset;
   HANDLE handle;
   OVERLAPPED overlapped, *overlapped_ptr;
   LARGE_INTEGER offset_;
@@ -827,20 +546,9 @@ void fs__read(uv_fs_t* req) {
   DWORD error;
   int result;
   unsigned int index;
-  LARGE_INTEGER original_position;
-  LARGE_INTEGER zero_offset;
-  int restore_position;
-  struct uv__fd_info_s fd_info;
 
   VERIFY_FD(fd, req);
 
-  if (uv__fd_hash_get(fd, &fd_info)) {
-    fs__read_filemap(req, &fd_info);
-    return;
-  }
-
-  zero_offset.QuadPart = 0;
-  restore_position = 0;
   handle = uv__get_osfhandle(fd);
 
   if (handle == INVALID_HANDLE_VALUE) {
@@ -851,10 +559,6 @@ void fs__read(uv_fs_t* req) {
   if (offset != -1) {
     memset(&overlapped, 0, sizeof overlapped);
     overlapped_ptr = &overlapped;
-    if (SetFilePointerEx(handle, zero_offset, &original_position,
-                         FILE_CURRENT)) {
-      restore_position = 1;
-    }
   } else {
     overlapped_ptr = NULL;
   }
@@ -871,16 +575,13 @@ void fs__read(uv_fs_t* req) {
     }
 
     result = ReadFile(handle,
-                      req->fs.info.bufs[index].base,
-                      req->fs.info.bufs[index].len,
+                      req->bufs[index].base,
+                      req->bufs[index].len,
                       &incremental_bytes,
                       overlapped_ptr);
     bytes += incremental_bytes;
     ++index;
-  } while (result && index < req->fs.info.nbufs);
-
-  if (restore_position)
-    SetFilePointerEx(handle, original_position, NULL, FILE_BEGIN);
+  } while (result && index < req->nbufs);
 
   if (result || bytes > 0) {
     SET_REQ_RESULT(req, bytes);
@@ -895,167 +596,27 @@ void fs__read(uv_fs_t* req) {
 }
 
 
-void fs__write_filemap(uv_fs_t* req, HANDLE file,
-                       struct uv__fd_info_s* fd_info) {
-  int fd = req->file.fd; /* VERIFY_FD done in fs__write */
-  int force_append = fd_info->flags & UV_FS_O_APPEND;
-  int rw_flags = fd_info->flags &
-    (UV_FS_O_RDONLY | UV_FS_O_WRONLY | UV_FS_O_RDWR);
-  size_t write_size, done_write;
-  unsigned int index;
-  LARGE_INTEGER zero, pos, end_pos;
-  size_t view_offset;
-  LARGE_INTEGER view_base;
-  void* view;
-  FILETIME ft;
-
-  if (rw_flags == UV_FS_O_RDONLY) {
-    SET_REQ_WIN32_ERROR(req, ERROR_ACCESS_DENIED);
-    return;
-  }
-  if (fd_info->is_directory) {
-    SET_REQ_WIN32_ERROR(req, ERROR_INVALID_FUNCTION);
-    return;
-  }
-
-  write_size = 0;
-  for (index = 0; index < req->fs.info.nbufs; ++index) {
-    write_size += req->fs.info.bufs[index].len;
-  }
-
-  if (write_size == 0) {
-    SET_REQ_RESULT(req, 0);
-    return;
-  }
-
-  zero.QuadPart = 0;
-  if (force_append) {
-    pos = fd_info->size;
-  } else if (req->fs.info.offset == -1) {
-    pos = fd_info->current_pos;
-  } else {
-    pos.QuadPart = req->fs.info.offset;
-  }
-
-  end_pos.QuadPart = pos.QuadPart + write_size;
-
-  /* Recreate the mapping to enlarge the file if needed */
-  if (end_pos.QuadPart > fd_info->size.QuadPart) {
-    if (fd_info->mapping != INVALID_HANDLE_VALUE) {
-      CloseHandle(fd_info->mapping);
-    }
-
-    fd_info->mapping = CreateFileMapping(file,
-                                         NULL,
-                                         PAGE_READWRITE,
-                                         end_pos.HighPart,
-                                         end_pos.LowPart,
-                                         NULL);
-    if (fd_info->mapping == NULL) {
-      SET_REQ_WIN32_ERROR(req, GetLastError());
-      CloseHandle(file);
-      fd_info->mapping = INVALID_HANDLE_VALUE;
-      fd_info->size.QuadPart = 0;
-      fd_info->current_pos.QuadPart = 0;
-      uv__fd_hash_add(fd, fd_info);
-      return;
-    }
-
-    fd_info->size = end_pos;
-    uv__fd_hash_add(fd, fd_info);
-  }
-
-  view_offset = pos.QuadPart % uv__allocation_granularity;
-  view_base.QuadPart = pos.QuadPart - view_offset;
-  view = MapViewOfFile(fd_info->mapping,
-                       FILE_MAP_WRITE,
-                       view_base.HighPart,
-                       view_base.LowPart,
-                       view_offset + write_size);
-  if (view == NULL) {
-    SET_REQ_WIN32_ERROR(req, GetLastError());
-    return;
-  }
-
-  done_write = 0;
-  for (index = 0; index < req->fs.info.nbufs; ++index) {
-    int err = 0;
-#ifdef _MSC_VER
-    __try {
-#endif
-      memcpy((char*)view + view_offset + done_write,
-             req->fs.info.bufs[index].base,
-             req->fs.info.bufs[index].len);
-#ifdef _MSC_VER
-    }
-    __except (fs__filemap_ex_filter(GetExceptionCode(),
-                                    GetExceptionInformation(), &err)) {
-      SET_REQ_WIN32_ERROR(req, err);
-      UnmapViewOfFile(view);
-      return;
-    }
-#endif
-    done_write += req->fs.info.bufs[index].len;
-  }
-  assert(done_write == write_size);
-
-  if (!FlushViewOfFile(view, 0)) {
-    SET_REQ_WIN32_ERROR(req, GetLastError());
-    UnmapViewOfFile(view);
-    return;
-  }
-  if (!UnmapViewOfFile(view)) {
-    SET_REQ_WIN32_ERROR(req, GetLastError());
-    return;
-  }
-
-  if (req->fs.info.offset == -1) {
-    fd_info->current_pos = end_pos;
-    uv__fd_hash_add(fd, fd_info);
-  }
-
-  GetSystemTimeAsFileTime(&ft);
-  SetFileTime(file, NULL, NULL, &ft);
-
-  SET_REQ_RESULT(req, done_write);
-}
-
 void fs__write(uv_fs_t* req) {
-  int fd = req->file.fd;
-  int64_t offset = req->fs.info.offset;
+  int fd = req->fd;
+  int64_t offset = req->offset;
   HANDLE handle;
   OVERLAPPED overlapped, *overlapped_ptr;
   LARGE_INTEGER offset_;
   DWORD bytes;
   int result;
   unsigned int index;
-  LARGE_INTEGER original_position;
-  LARGE_INTEGER zero_offset;
-  int restore_position;
-  struct uv__fd_info_s fd_info;
 
   VERIFY_FD(fd, req);
 
-  zero_offset.QuadPart = 0;
-  restore_position = 0;
   handle = uv__get_osfhandle(fd);
   if (handle == INVALID_HANDLE_VALUE) {
     SET_REQ_WIN32_ERROR(req, ERROR_INVALID_HANDLE);
     return;
   }
 
-  if (uv__fd_hash_get(fd, &fd_info)) {
-    fs__write_filemap(req, handle, &fd_info);
-    return;
-  }
-
   if (offset != -1) {
     memset(&overlapped, 0, sizeof overlapped);
     overlapped_ptr = &overlapped;
-    if (SetFilePointerEx(handle, zero_offset, &original_position,
-                         FILE_CURRENT)) {
-      restore_position = 1;
-    }
   } else {
     overlapped_ptr = NULL;
   }
@@ -1072,16 +633,13 @@ void fs__write(uv_fs_t* req) {
     }
 
     result = WriteFile(handle,
-                       req->fs.info.bufs[index].base,
-                       req->fs.info.bufs[index].len,
+                       req->bufs[index].base,
+                       req->bufs[index].len,
                        &incremental_bytes,
                        overlapped_ptr);
     bytes += incremental_bytes;
     ++index;
-  } while (result && index < req->fs.info.nbufs);
-
-  if (restore_position)
-    SetFilePointerEx(handle, original_position, NULL, FILE_BEGIN);
+  } while (result && index < req->nbufs);
 
   if (result || bytes > 0) {
     SET_REQ_RESULT(req, bytes);
@@ -1092,13 +650,13 @@ void fs__write(uv_fs_t* req) {
 
 
 void fs__rmdir(uv_fs_t* req) {
-  int result = _wrmdir(req->file.pathw);
+  int result = _wrmdir(req->pathw);
   SET_REQ_RESULT(req, result);
 }
 
 
 void fs__unlink(uv_fs_t* req) {
-  const WCHAR* pathw = req->file.pathw;
+  const WCHAR* pathw = req->pathw;
   HANDLE handle;
   BY_HANDLE_FILE_INFORMATION info;
   FILE_DISPOSITION_INFORMATION disposition;
@@ -1106,7 +664,7 @@ void fs__unlink(uv_fs_t* req) {
   NTSTATUS status;
 
   handle = CreateFileW(pathw,
-                       FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES | DELETE,
+                       FILE_READ_ATTRIBUTES | DELETE,
                        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                        NULL,
                        OPEN_EXISTING,
@@ -1125,9 +683,9 @@ void fs__unlink(uv_fs_t* req) {
   }
 
   if (info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
-    /* Do not allow deletion of directories, unless it is a symlink. When the
-     * path refers to a non-symlink directory, report EPERM as mandated by
-     * POSIX.1. */
+    /* Do not allow deletion of directories, unless it is a symlink. When */
+    /* the path refers to a non-symlink directory, report EPERM as mandated */
+    /* by POSIX.1. */
 
     /* Check if it is a reparse point. If it's not, it's a normal directory. */
     if (!(info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)) {
@@ -1136,32 +694,13 @@ void fs__unlink(uv_fs_t* req) {
       return;
     }
 
-    /* Read the reparse point and check if it is a valid symlink. If not, don't
-     * unlink. */
+    /* Read the reparse point and check if it is a valid symlink. */
+    /* If not, don't unlink. */
     if (fs__readlink_handle(handle, NULL, NULL) < 0) {
       DWORD error = GetLastError();
       if (error == ERROR_SYMLINK_NOT_SUPPORTED)
         error = ERROR_ACCESS_DENIED;
       SET_REQ_WIN32_ERROR(req, error);
-      CloseHandle(handle);
-      return;
-    }
-  }
-
-  if (info.dwFileAttributes & FILE_ATTRIBUTE_READONLY) {
-    /* Remove read-only attribute */
-    FILE_BASIC_INFORMATION basic = { 0 };
-
-    basic.FileAttributes = (info.dwFileAttributes & ~FILE_ATTRIBUTE_READONLY) |
-                           FILE_ATTRIBUTE_ARCHIVE;
-
-    status = pNtSetInformationFile(handle,
-                                   &iosb,
-                                   &basic,
-                                   sizeof basic,
-                                   FileBasicInformation);
-    if (!NT_SUCCESS(status)) {
-      SET_REQ_WIN32_ERROR(req, pRtlNtStatusToDosError(status));
       CloseHandle(handle);
       return;
     }
@@ -1186,19 +725,13 @@ void fs__unlink(uv_fs_t* req) {
 
 void fs__mkdir(uv_fs_t* req) {
   /* TODO: use req->mode. */
-  req->result = _wmkdir(req->file.pathw);
-  if (req->result == -1) {
-    req->sys_errno_ = _doserrno;
-    req->result = req->sys_errno_ == ERROR_INVALID_NAME
-                ? UV_EINVAL
-                : uv_translate_sys_error(req->sys_errno_);
-  }
+  int result = _wmkdir(req->pathw);
+  SET_REQ_RESULT(req, result);
 }
 
-typedef int (*uv__fs_mktemp_func)(uv_fs_t* req);
 
 /* OpenBSD original: lib/libc/stdio/mktemp.c */
-void fs__mktemp(uv_fs_t* req, uv__fs_mktemp_func func) {
+void fs__mkdtemp(uv_fs_t* req) {
   static const WCHAR *tempchars =
     L"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
   static const size_t num_chars = 62;
@@ -1206,19 +739,27 @@ void fs__mktemp(uv_fs_t* req, uv__fs_mktemp_func func) {
   WCHAR *cp, *ep;
   unsigned int tries, i;
   size_t len;
+  HCRYPTPROV h_crypt_prov;
   uint64_t v;
+  BOOL released;
 
-  len = wcslen(req->file.pathw);
-  ep = req->file.pathw + len;
+  len = wcslen(req->pathw);
+  ep = req->pathw + len;
   if (len < num_x || wcsncmp(ep - num_x, L"XXXXXX", num_x)) {
     SET_REQ_UV_ERROR(req, UV_EINVAL, ERROR_INVALID_PARAMETER);
     return;
   }
 
+  if (!CryptAcquireContext(&h_crypt_prov, NULL, NULL, PROV_RSA_FULL,
+                           CRYPT_VERIFYCONTEXT)) {
+    SET_REQ_WIN32_ERROR(req, GetLastError());
+    return;
+  }
+
   tries = TMP_MAX;
   do {
-    if (uv__random_rtlgenrandom((void *)&v, sizeof(v)) < 0) {
-      SET_REQ_UV_ERROR(req, UV_EIO, ERROR_IO_DEVICE);
+    if (!CryptGenRandom(h_crypt_prov, sizeof(v), (BYTE*) &v)) {
+      SET_REQ_WIN32_ERROR(req, GetLastError());
       break;
     }
 
@@ -1228,89 +769,22 @@ void fs__mktemp(uv_fs_t* req, uv__fs_mktemp_func func) {
       v /= num_chars;
     }
 
-    if (func(req)) {
-      if (req->result >= 0) {
-        len = strlen(req->path);
-        wcstombs((char*) req->path + len - num_x, ep - num_x, num_x);
-      }
+    if (_wmkdir(req->pathw) == 0) {
+      len = strlen(req->path);
+      wcstombs((char*) req->path + len - num_x, ep - num_x, num_x);
+      SET_REQ_RESULT(req, 0);
+      break;
+    } else if (errno != EEXIST) {
+      SET_REQ_RESULT(req, -1);
       break;
     }
   } while (--tries);
 
+  released = CryptReleaseContext(h_crypt_prov, 0);
+  assert(released);
   if (tries == 0) {
     SET_REQ_RESULT(req, -1);
   }
-}
-
-
-static int fs__mkdtemp_func(uv_fs_t* req) {
-  if (_wmkdir(req->file.pathw) == 0) {
-    SET_REQ_RESULT(req, 0);
-    return 1;
-  } else if (errno != EEXIST) {
-    SET_REQ_RESULT(req, -1);
-    return 1;
-  }
-
-  return 0;
-}
-
-
-void fs__mkdtemp(uv_fs_t* req) {
-  fs__mktemp(req, fs__mkdtemp_func);
-}
-
-
-static int fs__mkstemp_func(uv_fs_t* req) {
-  HANDLE file;
-  int fd;
-
-  file = CreateFileW(req->file.pathw,
-                     GENERIC_READ | GENERIC_WRITE,
-                     FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                     NULL,
-                     CREATE_NEW,
-                     FILE_ATTRIBUTE_NORMAL,
-                     NULL);
-
-  if (file == INVALID_HANDLE_VALUE) {
-    DWORD error;
-    error = GetLastError();
-
-    /* If the file exists, the main fs__mktemp() function
-       will retry. If it's another error, we want to stop. */
-    if (error != ERROR_FILE_EXISTS) {
-      SET_REQ_WIN32_ERROR(req, error);
-      return 1;
-    }
-
-    return 0;
-  }
-
-  fd = _open_osfhandle((intptr_t) file, 0);
-  if (fd < 0) {
-    /* The only known failure mode for _open_osfhandle() is EMFILE, in which
-     * case GetLastError() will return zero. However we'll try to handle other
-     * errors as well, should they ever occur.
-     */
-    if (errno == EMFILE)
-      SET_REQ_UV_ERROR(req, UV_EMFILE, ERROR_TOO_MANY_OPEN_FILES);
-    else if (GetLastError() != ERROR_SUCCESS)
-      SET_REQ_WIN32_ERROR(req, GetLastError());
-    else
-      SET_REQ_WIN32_ERROR(req, UV_UNKNOWN);
-    CloseHandle(file);
-    return 1;
-  }
-
-  SET_REQ_RESULT(req, fd);
-
-  return 1;
-}
-
-
-void fs__mkstemp(uv_fs_t* req) {
-  fs__mktemp(req, fs__mkstemp_func);
 }
 
 
@@ -1332,18 +806,14 @@ void fs__scandir(uv_fs_t* req) {
    * A file name is at most 256 WCHARs long.
    * According to MSDN, the buffer must be aligned at an 8-byte boundary.
    */
-#if _MSC_VER
   __declspec(align(8)) char buffer[8192];
-#else
-  __attribute__ ((aligned (8))) char buffer[8192];
-#endif
 
   STATIC_ASSERT(sizeof buffer >=
                 sizeof(FILE_DIRECTORY_INFORMATION) + 256 * sizeof(WCHAR));
 
   /* Open the directory. */
   dir_handle =
-      CreateFileW(req->file.pathw,
+      CreateFileW(req->pathw,
                   FILE_LIST_DIRECTORY | SYNCHRONIZE,
                   FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                   NULL,
@@ -1393,15 +863,7 @@ void fs__scandir(uv_fs_t* req) {
       /* Compute the length of the filename in WCHARs. */
       wchar_len = info->FileNameLength / sizeof info->FileName[0];
 
-      /* Skip over '.' and '..' entries.  It has been reported that
-       * the SharePoint driver includes the terminating zero byte in
-       * the filename length.  Strip those first.
-       */
-      while (wchar_len > 0 && info->FileName[wchar_len - 1] == L'\0')
-        wchar_len -= 1;
-
-      if (wchar_len == 0)
-        continue;
+      /* Skip over '.' and '..' entries. */
       if (wchar_len == 1 && info->FileName[0] == L'.')
         continue;
       if (wchar_len == 2 && info->FileName[0] == L'.' &&
@@ -1419,7 +881,7 @@ void fs__scandir(uv_fs_t* req) {
         size_t new_dirents_size =
             dirents_size == 0 ? dirents_initial_size : dirents_size << 1;
         uv__dirent_t** new_dirents =
-            uv__realloc(dirents, new_dirents_size * sizeof *dirents);
+            realloc(dirents, new_dirents_size * sizeof *dirents);
 
         if (new_dirents == NULL)
           goto out_of_memory_error;
@@ -1432,7 +894,7 @@ void fs__scandir(uv_fs_t* req) {
        * includes room for the first character of the filename, but `utf8_len`
        * doesn't count the NULL terminator at this point.
        */
-      dirent = uv__malloc(sizeof *dirent + utf8_len);
+      dirent = malloc(sizeof *dirent + utf8_len);
       if (dirent == NULL)
         goto out_of_memory_error;
 
@@ -1497,7 +959,7 @@ void fs__scandir(uv_fs_t* req) {
   SET_REQ_RESULT(req, dirents_used);
 
   /* `nbufs` will be used as index by uv_fs_scandir_next. */
-  req->fs.info.nbufs = 0;
+  req->nbufs = 0;
 
   return;
 
@@ -1521,145 +983,13 @@ cleanup:
   if (dir_handle != INVALID_HANDLE_VALUE)
     CloseHandle(dir_handle);
   while (dirents_used > 0)
-    uv__free(dirents[--dirents_used]);
+    free(dirents[--dirents_used]);
   if (dirents != NULL)
-    uv__free(dirents);
+    free(dirents);
 }
 
-void fs__opendir(uv_fs_t* req) {
-  WCHAR* pathw;
-  size_t len;
-  const WCHAR* fmt;
-  WCHAR* find_path;
-  uv_dir_t* dir;
 
-  pathw = req->file.pathw;
-  dir = NULL;
-  find_path = NULL;
-
-  /* Figure out whether path is a file or a directory. */
-  if (!(GetFileAttributesW(pathw) & FILE_ATTRIBUTE_DIRECTORY)) {
-    SET_REQ_UV_ERROR(req, UV_ENOTDIR, ERROR_DIRECTORY);
-    goto error;
-  }
-
-  dir = uv__malloc(sizeof(*dir));
-  if (dir == NULL) {
-    SET_REQ_UV_ERROR(req, UV_ENOMEM, ERROR_OUTOFMEMORY);
-    goto error;
-  }
-
-  len = wcslen(pathw);
-
-  if (len == 0)
-    fmt = L"./*";
-  else if (IS_SLASH(pathw[len - 1]))
-    fmt = L"%s*";
-  else
-    fmt = L"%s\\*";
-
-  find_path = uv__malloc(sizeof(WCHAR) * (len + 4));
-  if (find_path == NULL) {
-    SET_REQ_UV_ERROR(req, UV_ENOMEM, ERROR_OUTOFMEMORY);
-    goto error;
-  }
-
-  _snwprintf(find_path, len + 3, fmt, pathw);
-  dir->dir_handle = FindFirstFileW(find_path, &dir->find_data);
-  uv__free(find_path);
-  find_path = NULL;
-  if (dir->dir_handle == INVALID_HANDLE_VALUE &&
-      GetLastError() != ERROR_FILE_NOT_FOUND) {
-    SET_REQ_WIN32_ERROR(req, GetLastError());
-    goto error;
-  }
-
-  dir->need_find_call = FALSE;
-  req->ptr = dir;
-  SET_REQ_RESULT(req, 0);
-  return;
-
-error:
-  uv__free(dir);
-  uv__free(find_path);
-  req->ptr = NULL;
-}
-
-void fs__readdir(uv_fs_t* req) {
-  uv_dir_t* dir;
-  uv_dirent_t* dirents;
-  uv__dirent_t dent;
-  unsigned int dirent_idx;
-  PWIN32_FIND_DATAW find_data;
-  unsigned int i;
-  int r;
-
-  req->flags |= UV_FS_FREE_PTR;
-  dir = req->ptr;
-  dirents = dir->dirents;
-  memset(dirents, 0, dir->nentries * sizeof(*dir->dirents));
-  find_data = &dir->find_data;
-  dirent_idx = 0;
-
-  while (dirent_idx < dir->nentries) {
-    if (dir->need_find_call && FindNextFileW(dir->dir_handle, find_data) == 0) {
-      if (GetLastError() == ERROR_NO_MORE_FILES)
-        break;
-      goto error;
-    }
-
-    /* Skip "." and ".." entries. */
-    if (find_data->cFileName[0] == L'.' &&
-        (find_data->cFileName[1] == L'\0' ||
-        (find_data->cFileName[1] == L'.' &&
-        find_data->cFileName[2] == L'\0'))) {
-      dir->need_find_call = TRUE;
-      continue;
-    }
-
-    r = uv__convert_utf16_to_utf8((const WCHAR*) &find_data->cFileName,
-                                  -1,
-                                  (char**) &dirents[dirent_idx].name);
-    if (r != 0)
-      goto error;
-
-    /* Copy file type. */
-    if ((find_data->dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0)
-      dent.d_type = UV__DT_DIR;
-    else if ((find_data->dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0)
-      dent.d_type = UV__DT_LINK;
-    else if ((find_data->dwFileAttributes & FILE_ATTRIBUTE_DEVICE) != 0)
-      dent.d_type = UV__DT_CHAR;
-    else
-      dent.d_type = UV__DT_FILE;
-
-    dirents[dirent_idx].type = uv__fs_get_dirent_type(&dent);
-    dir->need_find_call = TRUE;
-    ++dirent_idx;
-  }
-
-  SET_REQ_RESULT(req, dirent_idx);
-  return;
-
-error:
-  SET_REQ_WIN32_ERROR(req, GetLastError());
-  for (i = 0; i < dirent_idx; ++i) {
-    uv__free((char*) dirents[i].name);
-    dirents[i].name = NULL;
-  }
-}
-
-void fs__closedir(uv_fs_t* req) {
-  uv_dir_t* dir;
-
-  dir = req->ptr;
-  FindClose(dir->dir_handle);
-  uv__free(req->ptr);
-  SET_REQ_RESULT(req, 0);
-}
-
-INLINE static int fs__stat_handle(HANDLE handle, uv_stat_t* statbuf,
-    int do_lstat) {
+INLINE static int fs__stat_handle(HANDLE handle, uv_stat_t* statbuf) {
   FILE_ALL_INFORMATION file_info;
   FILE_FS_VOLUME_INFORMATION volume_info;
   NTSTATUS nt_status;
@@ -1714,35 +1044,18 @@ INLINE static int fs__stat_handle(HANDLE handle, uv_stat_t* statbuf,
    */
   statbuf->st_mode = 0;
 
-  /*
-  * On Windows, FILE_ATTRIBUTE_REPARSE_POINT is a general purpose mechanism
-  * by which filesystem drivers can intercept and alter file system requests.
-  *
-  * The only reparse points we care about are symlinks and mount points, both
-  * of which are treated as POSIX symlinks. Further, we only care when
-  * invoked via lstat, which seeks information about the link instead of its
-  * target. Otherwise, reparse points must be treated as regular files.
-  */
-  if (do_lstat &&
-      (file_info.BasicInformation.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)) {
-    /*
-     * If reading the link fails, the reparse point is not a symlink and needs
-     * to be treated as a regular file. The higher level lstat function will
-     * detect this failure and retry without do_lstat if appropriate.
-     */
+  if (file_info.BasicInformation.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) {
+    statbuf->st_mode |= S_IFLNK;
     if (fs__readlink_handle(handle, NULL, &statbuf->st_size) != 0)
       return -1;
-    statbuf->st_mode |= S_IFLNK;
-  }
 
-  if (statbuf->st_mode == 0) {
-    if (file_info.BasicInformation.FileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
-      statbuf->st_mode |= _S_IFDIR;
-      statbuf->st_size = 0;
-    } else {
-      statbuf->st_mode |= _S_IFREG;
-      statbuf->st_size = file_info.StandardInformation.EndOfFile.QuadPart;
-    }
+  } else if (file_info.BasicInformation.FileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+    statbuf->st_mode |= _S_IFDIR;
+    statbuf->st_size = 0;
+
+  } else {
+    statbuf->st_mode |= _S_IFREG;
+    statbuf->st_size = file_info.StandardInformation.EndOfFile.QuadPart;
   }
 
   if (file_info.BasicInformation.FileAttributes & FILE_ATTRIBUTE_READONLY)
@@ -1760,7 +1073,7 @@ INLINE static int fs__stat_handle(HANDLE handle, uv_stat_t* statbuf,
 
   /* st_blocks contains the on-disk allocation size in 512-byte units. */
   statbuf->st_blocks =
-      (uint64_t) file_info.StandardInformation.AllocationSize.QuadPart >> 9;
+      file_info.StandardInformation.AllocationSize.QuadPart >> 9ULL;
 
   statbuf->st_nlink = file_info.StandardInformation.NumberOfLinks;
 
@@ -1775,12 +1088,8 @@ INLINE static int fs__stat_handle(HANDLE handle, uv_stat_t* statbuf,
    *
    * Therefore we'll just report a sensible value that's quite commonly okay
    * on modern hardware.
-   *
-   * 4096 is the minimum required to be compatible with newer Advanced Format
-   * drives (which have 4096 bytes per physical sector), and to be backwards
-   * compatible with older drives (which have 512 bytes per physical sector).
    */
-  statbuf->st_blksize = 4096;
+  statbuf->st_blksize = 2048;
 
   /* Todo: set st_flags to something meaningful. Also provide a wrapper for
    * chattr(2).
@@ -1810,74 +1119,62 @@ INLINE static void fs__stat_prepare_path(WCHAR* pathw) {
 }
 
 
-INLINE static DWORD fs__stat_impl_from_path(WCHAR* path,
-                                            int do_lstat,
-                                            uv_stat_t* statbuf) {
+INLINE static void fs__stat_impl(uv_fs_t* req, int do_lstat) {
   HANDLE handle;
   DWORD flags;
-  DWORD ret;
 
   flags = FILE_FLAG_BACKUP_SEMANTICS;
-  if (do_lstat)
+  if (do_lstat) {
     flags |= FILE_FLAG_OPEN_REPARSE_POINT;
+  }
 
-  handle = CreateFileW(path,
+  handle = CreateFileW(req->pathw,
                        FILE_READ_ATTRIBUTES,
                        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                        NULL,
                        OPEN_EXISTING,
                        flags,
                        NULL);
+  if (handle == INVALID_HANDLE_VALUE) {
+    SET_REQ_WIN32_ERROR(req, GetLastError());
+    return;
+  }
 
-  if (handle == INVALID_HANDLE_VALUE)
-    ret = GetLastError();
-  else if (fs__stat_handle(handle, statbuf, do_lstat) != 0)
-    ret = GetLastError();
-  else
-    ret = 0;
-
-  CloseHandle(handle);
-  return ret;
-}
-
-
-INLINE static void fs__stat_impl(uv_fs_t* req, int do_lstat) {
-  DWORD error;
-
-  error = fs__stat_impl_from_path(req->file.pathw, do_lstat, &req->statbuf);
-  if (error != 0) {
-    if (do_lstat &&
-        (error == ERROR_SYMLINK_NOT_SUPPORTED ||
-         error == ERROR_NOT_A_REPARSE_POINT)) {
+  if (fs__stat_handle(handle, &req->statbuf) != 0) {
+    DWORD error = GetLastError();
+    if (do_lstat && error == ERROR_SYMLINK_NOT_SUPPORTED) {
       /* We opened a reparse point but it was not a symlink. Try again. */
       fs__stat_impl(req, 0);
+
     } else {
       /* Stat failed. */
-      SET_REQ_WIN32_ERROR(req, error);
+      SET_REQ_WIN32_ERROR(req, GetLastError());
     }
 
+    CloseHandle(handle);
     return;
   }
 
   req->ptr = &req->statbuf;
   req->result = 0;
+  CloseHandle(handle);
 }
 
 
 static void fs__stat(uv_fs_t* req) {
-  fs__stat_prepare_path(req->file.pathw);
+  fs__stat_prepare_path(req->pathw);
   fs__stat_impl(req, 0);
 }
 
 
 static void fs__lstat(uv_fs_t* req) {
-  fs__stat_prepare_path(req->file.pathw);
+  fs__stat_prepare_path(req->pathw);
   fs__stat_impl(req, 1);
 }
 
 
 static void fs__fstat(uv_fs_t* req) {
-  int fd = req->file.fd;
+  int fd = req->fd;
   HANDLE handle;
 
   VERIFY_FD(fd, req);
@@ -1889,7 +1186,7 @@ static void fs__fstat(uv_fs_t* req) {
     return;
   }
 
-  if (fs__stat_handle(handle, &req->statbuf, 0) != 0) {
+  if (fs__stat_handle(handle, &req->statbuf) != 0) {
     SET_REQ_WIN32_ERROR(req, GetLastError());
     return;
   }
@@ -1900,7 +1197,7 @@ static void fs__fstat(uv_fs_t* req) {
 
 
 static void fs__rename(uv_fs_t* req) {
-  if (!MoveFileExW(req->file.pathw, req->fs.info.new_pathw, MOVEFILE_REPLACE_EXISTING)) {
+  if (!MoveFileExW(req->pathw, req->new_pathw, MOVEFILE_REPLACE_EXISTING)) {
     SET_REQ_WIN32_ERROR(req, GetLastError());
     return;
   }
@@ -1910,7 +1207,7 @@ static void fs__rename(uv_fs_t* req) {
 
 
 INLINE static void fs__sync_impl(uv_fs_t* req) {
-  int fd = req->file.fd;
+  int fd = req->fd;
   int result;
 
   VERIFY_FD(fd, req);
@@ -1935,9 +1232,8 @@ static void fs__fdatasync(uv_fs_t* req) {
 
 
 static void fs__ftruncate(uv_fs_t* req) {
-  int fd = req->file.fd;
+  int fd = req->fd;
   HANDLE handle;
-  struct uv__fd_info_s fd_info = { 0 };
   NTSTATUS status;
   IO_STATUS_BLOCK io_status;
   FILE_END_OF_FILE_INFORMATION eof_info;
@@ -1946,18 +1242,7 @@ static void fs__ftruncate(uv_fs_t* req) {
 
   handle = uv__get_osfhandle(fd);
 
-  if (uv__fd_hash_get(fd, &fd_info)) {
-    if (fd_info.is_directory) {
-      SET_REQ_WIN32_ERROR(req, ERROR_ACCESS_DENIED);
-      return;
-    }
-
-    if (fd_info.mapping != INVALID_HANDLE_VALUE) {
-      CloseHandle(fd_info.mapping);
-    }
-  }
-
-  eof_info.EndOfFile.QuadPart = req->fs.info.offset;
+  eof_info.EndOfFile.QuadPart = req->offset;
 
   status = pNtSetInformationFile(handle,
                                  &io_status,
@@ -1969,95 +1254,21 @@ static void fs__ftruncate(uv_fs_t* req) {
     SET_REQ_RESULT(req, 0);
   } else {
     SET_REQ_WIN32_ERROR(req, pRtlNtStatusToDosError(status));
-
-    if (fd_info.flags) {
-      CloseHandle(handle);
-      fd_info.mapping = INVALID_HANDLE_VALUE;
-      fd_info.size.QuadPart = 0;
-      fd_info.current_pos.QuadPart = 0;
-      uv__fd_hash_add(fd, &fd_info);
-      return;
-    }
-  }
-
-  if (fd_info.flags) {
-    fd_info.size = eof_info.EndOfFile;
-
-    if (fd_info.size.QuadPart == 0) {
-      fd_info.mapping = INVALID_HANDLE_VALUE;
-    } else {
-      DWORD flProtect = (fd_info.flags & (UV_FS_O_RDONLY | UV_FS_O_WRONLY |
-        UV_FS_O_RDWR)) == UV_FS_O_RDONLY ? PAGE_READONLY : PAGE_READWRITE;
-      fd_info.mapping = CreateFileMapping(handle,
-                                          NULL,
-                                          flProtect,
-                                          fd_info.size.HighPart,
-                                          fd_info.size.LowPart,
-                                          NULL);
-      if (fd_info.mapping == NULL) {
-        SET_REQ_WIN32_ERROR(req, GetLastError());
-        CloseHandle(handle);
-        fd_info.mapping = INVALID_HANDLE_VALUE;
-        fd_info.size.QuadPart = 0;
-        fd_info.current_pos.QuadPart = 0;
-        uv__fd_hash_add(fd, &fd_info);
-        return;
-      }
-    }
-
-    uv__fd_hash_add(fd, &fd_info);
-  }
-}
-
-
-static void fs__copyfile(uv_fs_t* req) {
-  int flags;
-  int overwrite;
-  uv_stat_t statbuf;
-  uv_stat_t new_statbuf;
-
-  flags = req->fs.info.file_flags;
-
-  if (flags & UV_FS_COPYFILE_FICLONE_FORCE) {
-    SET_REQ_UV_ERROR(req, UV_ENOSYS, ERROR_NOT_SUPPORTED);
-    return;
-  }
-
-  overwrite = flags & UV_FS_COPYFILE_EXCL;
-
-  if (CopyFileW(req->file.pathw, req->fs.info.new_pathw, overwrite) != 0) {
-    SET_REQ_RESULT(req, 0);
-    return;
-  }
-
-  SET_REQ_WIN32_ERROR(req, GetLastError());
-  if (req->result != UV_EBUSY)
-    return;
-
-  /* if error UV_EBUSY check if src and dst file are the same */
-  if (fs__stat_impl_from_path(req->file.pathw, 0, &statbuf) != 0 ||
-      fs__stat_impl_from_path(req->fs.info.new_pathw, 0, &new_statbuf) != 0) {
-    return;
-  }
-
-  if (statbuf.st_dev == new_statbuf.st_dev &&
-      statbuf.st_ino == new_statbuf.st_ino) {
-    SET_REQ_RESULT(req, 0);
   }
 }
 
 
 static void fs__sendfile(uv_fs_t* req) {
-  int fd_in = req->file.fd, fd_out = req->fs.info.fd_out;
-  size_t length = req->fs.info.bufsml[0].len;
-  int64_t offset = req->fs.info.offset;
+  int fd_in = req->fd, fd_out = req->fd_out;
+  size_t length = req->bufsml[0].len;
+  int64_t offset = req->offset;
   const size_t max_buf_size = 65536;
   size_t buf_size = length < max_buf_size ? length : max_buf_size;
   int n, result = 0;
   int64_t result_offset = 0;
-  char* buf = (char*) uv__malloc(buf_size);
+  char* buf = (char*) malloc(buf_size);
   if (!buf) {
-    uv_fatal_error(ERROR_OUTOFMEMORY, "uv__malloc");
+    uv_fatal_error(ERROR_OUTOFMEMORY, "malloc");
   }
 
   if (offset != -1) {
@@ -2088,47 +1299,39 @@ static void fs__sendfile(uv_fs_t* req) {
     }
   }
 
-  uv__free(buf);
+  free(buf);
 
   SET_REQ_RESULT(req, result);
 }
 
 
 static void fs__access(uv_fs_t* req) {
-  DWORD attr = GetFileAttributesW(req->file.pathw);
+  DWORD attr = GetFileAttributesW(req->pathw);
 
   if (attr == INVALID_FILE_ATTRIBUTES) {
     SET_REQ_WIN32_ERROR(req, GetLastError());
     return;
   }
 
-  /*
-   * Access is possible if
-   * - write access wasn't requested,
-   * - or the file isn't read-only,
-   * - or it's a directory.
-   * (Directories cannot be read-only on Windows.)
-   */
-  if (!(req->fs.info.mode & W_OK) ||
-      !(attr & FILE_ATTRIBUTE_READONLY) ||
-      (attr & FILE_ATTRIBUTE_DIRECTORY)) {
-    SET_REQ_RESULT(req, 0);
-  } else {
+  if ((req->flags & W_OK) &&
+      ((attr & FILE_ATTRIBUTE_READONLY) ||
+      (attr & FILE_ATTRIBUTE_DIRECTORY))) {
     SET_REQ_WIN32_ERROR(req, UV_EPERM);
+    return;
   }
 
+  SET_REQ_RESULT(req, 0);
 }
 
 
 static void fs__chmod(uv_fs_t* req) {
-  int result = _wchmod(req->file.pathw, req->fs.info.mode);
+  int result = _wchmod(req->pathw, req->mode);
   SET_REQ_RESULT(req, result);
 }
 
 
 static void fs__fchmod(uv_fs_t* req) {
-  int fd = req->file.fd;
-  int clear_archive_flag;
+  int fd = req->fd;
   HANDLE handle;
   NTSTATUS nt_status;
   IO_STATUS_BLOCK io_status;
@@ -2136,11 +1339,7 @@ static void fs__fchmod(uv_fs_t* req) {
 
   VERIFY_FD(fd, req);
 
-  handle = ReOpenFile(uv__get_osfhandle(fd), FILE_WRITE_ATTRIBUTES, 0, 0);
-  if (handle == INVALID_HANDLE_VALUE) {
-    SET_REQ_WIN32_ERROR(req, GetLastError());
-    return;
-  }
+  handle = uv__get_osfhandle(fd);
 
   nt_status = pNtQueryInformationFile(handle,
                                       &io_status,
@@ -2150,30 +1349,10 @@ static void fs__fchmod(uv_fs_t* req) {
 
   if (!NT_SUCCESS(nt_status)) {
     SET_REQ_WIN32_ERROR(req, pRtlNtStatusToDosError(nt_status));
-    goto fchmod_cleanup;
+    return;
   }
 
-  /* Test if the Archive attribute is cleared */
-  if ((file_info.FileAttributes & FILE_ATTRIBUTE_ARCHIVE) == 0) {
-      /* Set Archive flag, otherwise setting or clearing the read-only
-         flag will not work */
-      file_info.FileAttributes |= FILE_ATTRIBUTE_ARCHIVE;
-      nt_status = pNtSetInformationFile(handle,
-                                        &io_status,
-                                        &file_info,
-                                        sizeof file_info,
-                                        FileBasicInformation);
-      if (!NT_SUCCESS(nt_status)) {
-        SET_REQ_WIN32_ERROR(req, pRtlNtStatusToDosError(nt_status));
-        goto fchmod_cleanup;
-      }
-      /* Remeber to clear the flag later on */
-      clear_archive_flag = 1;
-  } else {
-      clear_archive_flag = 0;
-  }
-
-  if (req->fs.info.mode & _S_IWRITE) {
+  if (req->mode & _S_IWRITE) {
     file_info.FileAttributes &= ~FILE_ATTRIBUTE_READONLY;
   } else {
     file_info.FileAttributes |= FILE_ATTRIBUTE_READONLY;
@@ -2187,36 +1366,18 @@ static void fs__fchmod(uv_fs_t* req) {
 
   if (!NT_SUCCESS(nt_status)) {
     SET_REQ_WIN32_ERROR(req, pRtlNtStatusToDosError(nt_status));
-    goto fchmod_cleanup;
-  }
-
-  if (clear_archive_flag) {
-      file_info.FileAttributes &= ~FILE_ATTRIBUTE_ARCHIVE;
-      if (file_info.FileAttributes == 0) {
-          file_info.FileAttributes = FILE_ATTRIBUTE_NORMAL;
-      }
-      nt_status = pNtSetInformationFile(handle,
-                                        &io_status,
-                                        &file_info,
-                                        sizeof file_info,
-                                        FileBasicInformation);
-      if (!NT_SUCCESS(nt_status)) {
-        SET_REQ_WIN32_ERROR(req, pRtlNtStatusToDosError(nt_status));
-        goto fchmod_cleanup;
-      }
+    return;
   }
 
   SET_REQ_SUCCESS(req);
-fchmod_cleanup:
-  CloseHandle(handle);
 }
 
 
 INLINE static int fs__utime_handle(HANDLE handle, double atime, double mtime) {
   FILETIME filetime_a, filetime_m;
 
-  TIME_T_TO_FILETIME(atime, &filetime_a);
-  TIME_T_TO_FILETIME(mtime, &filetime_m);
+  TIME_T_TO_FILETIME((time_t) atime, &filetime_a);
+  TIME_T_TO_FILETIME((time_t) mtime, &filetime_m);
 
   if (!SetFileTime(handle, NULL, &filetime_a, &filetime_m)) {
     return -1;
@@ -2229,7 +1390,7 @@ INLINE static int fs__utime_handle(HANDLE handle, double atime, double mtime) {
 static void fs__utime(uv_fs_t* req) {
   HANDLE handle;
 
-  handle = CreateFileW(req->file.pathw,
+  handle = CreateFileW(req->pathw,
                        FILE_WRITE_ATTRIBUTES,
                        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                        NULL,
@@ -2242,7 +1403,7 @@ static void fs__utime(uv_fs_t* req) {
     return;
   }
 
-  if (fs__utime_handle(handle, req->fs.time.atime, req->fs.time.mtime) != 0) {
+  if (fs__utime_handle(handle, req->atime, req->mtime) != 0) {
     SET_REQ_WIN32_ERROR(req, GetLastError());
     CloseHandle(handle);
     return;
@@ -2255,7 +1416,7 @@ static void fs__utime(uv_fs_t* req) {
 
 
 static void fs__futime(uv_fs_t* req) {
-  int fd = req->file.fd;
+  int fd = req->fd;
   HANDLE handle;
   VERIFY_FD(fd, req);
 
@@ -2266,7 +1427,7 @@ static void fs__futime(uv_fs_t* req) {
     return;
   }
 
-  if (fs__utime_handle(handle, req->fs.time.atime, req->fs.time.mtime) != 0) {
+  if (fs__utime_handle(handle, req->atime, req->mtime) != 0) {
     SET_REQ_WIN32_ERROR(req, GetLastError());
     return;
   }
@@ -2276,7 +1437,7 @@ static void fs__futime(uv_fs_t* req) {
 
 
 static void fs__link(uv_fs_t* req) {
-  DWORD r = CreateHardLinkW(req->fs.info.new_pathw, req->file.pathw, NULL);
+  DWORD r = CreateHardLinkW(req->new_pathw, req->pathw, NULL);
   if (r == 0) {
     SET_REQ_WIN32_ERROR(req, GetLastError());
   } else {
@@ -2321,9 +1482,9 @@ static void fs__create_junction(uv_fs_t* req, const WCHAR* path,
       2 * (target_len + 2) * sizeof(WCHAR);
 
   /* Allocate the buffer */
-  buffer = (REPARSE_DATA_BUFFER*)uv__malloc(needed_buf_size);
+  buffer = (REPARSE_DATA_BUFFER*)malloc(needed_buf_size);
   if (!buffer) {
-    uv_fatal_error(ERROR_OUTOFMEMORY, "uv__malloc");
+    uv_fatal_error(ERROR_OUTOFMEMORY, "malloc");
   }
 
   /* Grab a pointer to the part of the buffer where filenames go */
@@ -2437,13 +1598,13 @@ static void fs__create_junction(uv_fs_t* req, const WCHAR* path,
 
   /* Clean up */
   CloseHandle(handle);
-  uv__free(buffer);
+  free(buffer);
 
   SET_REQ_RESULT(req, 0);
   return;
 
 error:
-  uv__free(buffer);
+  free(buffer);
 
   if (handle != INVALID_HANDLE_VALUE) {
     CloseHandle(handle);
@@ -2456,42 +1617,25 @@ error:
 
 
 static void fs__symlink(uv_fs_t* req) {
-  WCHAR* pathw;
-  WCHAR* new_pathw;
-  int flags;
-  int err;
+  WCHAR* pathw = req->pathw;
+  WCHAR* new_pathw = req->new_pathw;
+  int flags = req->file_flags;
+  int result;
 
-  pathw = req->file.pathw;
-  new_pathw = req->fs.info.new_pathw;
 
-  if (req->fs.info.file_flags & UV_FS_SYMLINK_JUNCTION) {
+  if (flags & UV_FS_SYMLINK_JUNCTION) {
     fs__create_junction(req, pathw, new_pathw);
-    return;
-  }
-
-  if (req->fs.info.file_flags & UV_FS_SYMLINK_DIR)
-    flags = SYMBOLIC_LINK_FLAG_DIRECTORY | uv__file_symlink_usermode_flag;
-  else
-    flags = uv__file_symlink_usermode_flag;
-
-  if (CreateSymbolicLinkW(new_pathw, pathw, flags)) {
-    SET_REQ_RESULT(req, 0);
-    return;
-  }
-
-  /* Something went wrong. We will test if it is because of user-mode
-   * symlinks.
-   */
-  err = GetLastError();
-  if (err == ERROR_INVALID_PARAMETER &&
-      flags & SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE) {
-    /* This system does not support user-mode symlinks. We will clear the
-     * unsupported flag and retry.
-     */
-    uv__file_symlink_usermode_flag = 0;
-    fs__symlink(req);
+  } else if (pCreateSymbolicLinkW) {
+    result = pCreateSymbolicLinkW(new_pathw,
+                                  pathw,
+                                  flags & UV_FS_SYMLINK_DIR ? SYMBOLIC_LINK_FLAG_DIRECTORY : 0) ? 0 : -1;
+    if (result == -1) {
+      SET_REQ_WIN32_ERROR(req, GetLastError());
+    } else {
+      SET_REQ_RESULT(req, result);
+    }
   } else {
-    SET_REQ_WIN32_ERROR(req, err);
+    SET_REQ_UV_ERROR(req, UV_ENOSYS, ERROR_NOT_SUPPORTED);
   }
 }
 
@@ -2499,7 +1643,7 @@ static void fs__symlink(uv_fs_t* req) {
 static void fs__readlink(uv_fs_t* req) {
   HANDLE handle;
 
-  handle = CreateFileW(req->file.pathw,
+  handle = CreateFileW(req->pathw,
                        0,
                        0,
                        NULL,
@@ -2525,80 +1669,6 @@ static void fs__readlink(uv_fs_t* req) {
 }
 
 
-static ssize_t fs__realpath_handle(HANDLE handle, char** realpath_ptr) {
-  int r;
-  DWORD w_realpath_len;
-  WCHAR* w_realpath_ptr = NULL;
-  WCHAR* w_realpath_buf;
-
-  w_realpath_len = GetFinalPathNameByHandleW(handle, NULL, 0, VOLUME_NAME_DOS);
-  if (w_realpath_len == 0) {
-    return -1;
-  }
-
-  w_realpath_buf = uv__malloc((w_realpath_len + 1) * sizeof(WCHAR));
-  if (w_realpath_buf == NULL) {
-    SetLastError(ERROR_OUTOFMEMORY);
-    return -1;
-  }
-  w_realpath_ptr = w_realpath_buf;
-
-  if (GetFinalPathNameByHandleW(
-          handle, w_realpath_ptr, w_realpath_len, VOLUME_NAME_DOS) == 0) {
-    uv__free(w_realpath_buf);
-    SetLastError(ERROR_INVALID_HANDLE);
-    return -1;
-  }
-
-  /* convert UNC path to long path */
-  if (wcsncmp(w_realpath_ptr,
-              UNC_PATH_PREFIX,
-              UNC_PATH_PREFIX_LEN) == 0) {
-    w_realpath_ptr += 6;
-    *w_realpath_ptr = L'\\';
-    w_realpath_len -= 6;
-  } else if (wcsncmp(w_realpath_ptr,
-                      LONG_PATH_PREFIX,
-                      LONG_PATH_PREFIX_LEN) == 0) {
-    w_realpath_ptr += 4;
-    w_realpath_len -= 4;
-  } else {
-    uv__free(w_realpath_buf);
-    SetLastError(ERROR_INVALID_HANDLE);
-    return -1;
-  }
-
-  r = fs__wide_to_utf8(w_realpath_ptr, w_realpath_len, realpath_ptr, NULL);
-  uv__free(w_realpath_buf);
-  return r;
-}
-
-static void fs__realpath(uv_fs_t* req) {
-  HANDLE handle;
-
-  handle = CreateFileW(req->file.pathw,
-                       0,
-                       0,
-                       NULL,
-                       OPEN_EXISTING,
-                       FILE_ATTRIBUTE_NORMAL | FILE_FLAG_BACKUP_SEMANTICS,
-                       NULL);
-  if (handle == INVALID_HANDLE_VALUE) {
-    SET_REQ_WIN32_ERROR(req, GetLastError());
-    return;
-  }
-
-  if (fs__realpath_handle(handle, (char**) &req->ptr) == -1) {
-    CloseHandle(handle);
-    SET_REQ_WIN32_ERROR(req, GetLastError());
-    return;
-  }
-
-  CloseHandle(handle);
-  req->flags |= UV_FS_FREE_PTR;
-  SET_REQ_RESULT(req, 0);
-}
-
 
 static void fs__chown(uv_fs_t* req) {
   req->result = 0;
@@ -2607,46 +1677,6 @@ static void fs__chown(uv_fs_t* req) {
 
 static void fs__fchown(uv_fs_t* req) {
   req->result = 0;
-}
-
-
-static void fs__lchown(uv_fs_t* req) {
-  req->result = 0;
-}
-
-
-static void fs__statfs(uv_fs_t* req) {
-  uv_statfs_t* stat_fs;
-  DWORD sectors_per_cluster;
-  DWORD bytes_per_sector;
-  DWORD free_clusters;
-  DWORD total_clusters;
-
-  if (0 == GetDiskFreeSpaceW(req->file.pathw,
-                             &sectors_per_cluster,
-                             &bytes_per_sector,
-                             &free_clusters,
-                             &total_clusters)) {
-    SET_REQ_WIN32_ERROR(req, GetLastError());
-    return;
-  }
-
-  stat_fs = uv__malloc(sizeof(*stat_fs));
-  if (stat_fs == NULL) {
-    SET_REQ_UV_ERROR(req, UV_ENOMEM, ERROR_OUTOFMEMORY);
-    return;
-  }
-
-  stat_fs->f_type = 0;
-  stat_fs->f_bsize = bytes_per_sector * sectors_per_cluster;
-  stat_fs->f_blocks = total_clusters;
-  stat_fs->f_bfree = free_clusters;
-  stat_fs->f_bavail = free_clusters;
-  stat_fs->f_files = 0;
-  stat_fs->f_ffree = 0;
-  req->ptr = stat_fs;
-  req->flags |= UV_FS_FREE_PTR;
-  SET_REQ_RESULT(req, 0);
 }
 
 
@@ -2662,7 +1692,6 @@ static void uv__fs_work(struct uv__work* w) {
     XX(CLOSE, close)
     XX(READ, read)
     XX(WRITE, write)
-    XX(COPYFILE, copyfile)
     XX(SENDFILE, sendfile)
     XX(STAT, stat)
     XX(LSTAT, lstat)
@@ -2679,20 +1708,13 @@ static void uv__fs_work(struct uv__work* w) {
     XX(RMDIR, rmdir)
     XX(MKDIR, mkdir)
     XX(MKDTEMP, mkdtemp)
-    XX(MKSTEMP, mkstemp)
     XX(RENAME, rename)
     XX(SCANDIR, scandir)
-    XX(READDIR, readdir)
-    XX(OPENDIR, opendir)
-    XX(CLOSEDIR, closedir)
     XX(LINK, link)
     XX(SYMLINK, symlink)
     XX(READLINK, readlink)
-    XX(REALPATH, realpath)
     XX(CHOWN, chown)
-    XX(FCHOWN, fchown)
-    XX(LCHOWN, lchown)
-    XX(STATFS, statfs)
+    XX(FCHOWN, fchown);
     default:
       assert(!"bad uv_fs_type");
   }
@@ -2710,36 +1732,24 @@ static void uv__fs_done(struct uv__work* w, int status) {
     req->result = UV_ECANCELED;
   }
 
-  req->cb(req);
+  if (req->cb != NULL)
+    req->cb(req);
 }
 
 
 void uv_fs_req_cleanup(uv_fs_t* req) {
-  if (req == NULL)
-    return;
-
   if (req->flags & UV_FS_CLEANEDUP)
     return;
 
   if (req->flags & UV_FS_FREE_PATHS)
-    uv__free(req->file.pathw);
+    free(req->pathw);
 
-  if (req->flags & UV_FS_FREE_PTR) {
-    if (req->fs_type == UV_FS_SCANDIR && req->ptr != NULL)
-      uv__fs_scandir_cleanup(req);
-    else if (req->fs_type == UV_FS_READDIR)
-      uv__fs_readdir_cleanup(req);
-    else
-      uv__free(req->ptr);
-  }
-
-  if (req->fs.info.bufs != req->fs.info.bufsml)
-    uv__free(req->fs.info.bufs);
+  if (req->flags & UV_FS_FREE_PTR)
+    free(req->ptr);
 
   req->path = NULL;
-  req->file.pathw = NULL;
-  req->fs.info.new_pathw = NULL;
-  req->fs.info.bufs = NULL;
+  req->pathw = NULL;
+  req->new_pathw = NULL;
   req->ptr = NULL;
 
   req->flags |= UV_FS_CLEANEDUP;
@@ -2750,22 +1760,37 @@ int uv_fs_open(uv_loop_t* loop, uv_fs_t* req, const char* path, int flags,
     int mode, uv_fs_cb cb) {
   int err;
 
-  INIT(UV_FS_OPEN);
-  err = fs__capture_path(req, path, NULL, cb != NULL);
+  uv_fs_req_init(loop, req, UV_FS_OPEN, cb);
+
+  err = fs__capture_path(loop, req, path, NULL, cb != NULL);
   if (err) {
     return uv_translate_sys_error(err);
   }
 
-  req->fs.info.file_flags = flags;
-  req->fs.info.mode = mode;
-  POST;
+  req->file_flags = flags;
+  req->mode = mode;
+
+  if (cb) {
+    QUEUE_FS_TP_JOB(loop, req);
+    return 0;
+  } else {
+    fs__open(req);
+    return req->result;
+  }
 }
 
 
 int uv_fs_close(uv_loop_t* loop, uv_fs_t* req, uv_file fd, uv_fs_cb cb) {
-  INIT(UV_FS_CLOSE);
-  req->file.fd = fd;
-  POST;
+  uv_fs_req_init(loop, req, UV_FS_CLOSE, cb);
+  req->fd = fd;
+
+  if (cb) {
+    QUEUE_FS_TP_JOB(loop, req);
+    return 0;
+  } else {
+    fs__close(req);
+    return req->result;
+  }
 }
 
 
@@ -2776,25 +1801,29 @@ int uv_fs_read(uv_loop_t* loop,
                unsigned int nbufs,
                int64_t offset,
                uv_fs_cb cb) {
-  INIT(UV_FS_READ);
+  uv_fs_req_init(loop, req, UV_FS_READ, cb);
 
-  if (bufs == NULL || nbufs == 0)
-    return UV_EINVAL;
+  req->fd = fd;
 
-  req->file.fd = fd;
+  req->nbufs = nbufs;
+  req->bufs = req->bufsml;
+  if (nbufs > ARRAY_SIZE(req->bufsml))
+    req->bufs = malloc(nbufs * sizeof(*bufs));
 
-  req->fs.info.nbufs = nbufs;
-  req->fs.info.bufs = req->fs.info.bufsml;
-  if (nbufs > ARRAY_SIZE(req->fs.info.bufsml))
-    req->fs.info.bufs = uv__malloc(nbufs * sizeof(*bufs));
-
-  if (req->fs.info.bufs == NULL)
+  if (req->bufs == NULL)
     return UV_ENOMEM;
 
-  memcpy(req->fs.info.bufs, bufs, nbufs * sizeof(*bufs));
+  memcpy(req->bufs, bufs, nbufs * sizeof(*bufs));
 
-  req->fs.info.offset = offset;
-  POST;
+  req->offset = offset;
+
+  if (cb) {
+    QUEUE_FS_TP_JOB(loop, req);
+    return 0;
+  } else {
+    fs__read(req);
+    return req->result;
+  }
 }
 
 
@@ -2805,25 +1834,29 @@ int uv_fs_write(uv_loop_t* loop,
                 unsigned int nbufs,
                 int64_t offset,
                 uv_fs_cb cb) {
-  INIT(UV_FS_WRITE);
+  uv_fs_req_init(loop, req, UV_FS_WRITE, cb);
 
-  if (bufs == NULL || nbufs == 0)
-    return UV_EINVAL;
+  req->fd = fd;
 
-  req->file.fd = fd;
+  req->nbufs = nbufs;
+  req->bufs = req->bufsml;
+  if (nbufs > ARRAY_SIZE(req->bufsml))
+    req->bufs = malloc(nbufs * sizeof(*bufs));
 
-  req->fs.info.nbufs = nbufs;
-  req->fs.info.bufs = req->fs.info.bufsml;
-  if (nbufs > ARRAY_SIZE(req->fs.info.bufsml))
-    req->fs.info.bufs = uv__malloc(nbufs * sizeof(*bufs));
-
-  if (req->fs.info.bufs == NULL)
+  if (req->bufs == NULL)
     return UV_ENOMEM;
 
-  memcpy(req->fs.info.bufs, bufs, nbufs * sizeof(*bufs));
+  memcpy(req->bufs, bufs, nbufs * sizeof(*bufs));
 
-  req->fs.info.offset = offset;
-  POST;
+  req->offset = offset;
+
+  if (cb) {
+    QUEUE_FS_TP_JOB(loop, req);
+    return 0;
+  } else {
+    fs__write(req);
+    return req->result;
+  }
 }
 
 
@@ -2831,13 +1864,20 @@ int uv_fs_unlink(uv_loop_t* loop, uv_fs_t* req, const char* path,
     uv_fs_cb cb) {
   int err;
 
-  INIT(UV_FS_UNLINK);
-  err = fs__capture_path(req, path, NULL, cb != NULL);
+  uv_fs_req_init(loop, req, UV_FS_UNLINK, cb);
+
+  err = fs__capture_path(loop, req, path, NULL, cb != NULL);
   if (err) {
     return uv_translate_sys_error(err);
   }
 
-  POST;
+  if (cb) {
+    QUEUE_FS_TP_JOB(loop, req);
+    return 0;
+  } else {
+    fs__unlink(req);
+    return req->result;
+  }
 }
 
 
@@ -2845,57 +1885,62 @@ int uv_fs_mkdir(uv_loop_t* loop, uv_fs_t* req, const char* path, int mode,
     uv_fs_cb cb) {
   int err;
 
-  INIT(UV_FS_MKDIR);
-  err = fs__capture_path(req, path, NULL, cb != NULL);
+  uv_fs_req_init(loop, req, UV_FS_MKDIR, cb);
+
+  err = fs__capture_path(loop, req, path, NULL, cb != NULL);
   if (err) {
     return uv_translate_sys_error(err);
   }
 
-  req->fs.info.mode = mode;
-  POST;
+  req->mode = mode;
+
+  if (cb) {
+    QUEUE_FS_TP_JOB(loop, req);
+    return 0;
+  } else {
+    fs__mkdir(req);
+    return req->result;
+  }
 }
 
 
-int uv_fs_mkdtemp(uv_loop_t* loop,
-                  uv_fs_t* req,
-                  const char* tpl,
-                  uv_fs_cb cb) {
+int uv_fs_mkdtemp(uv_loop_t* loop, uv_fs_t* req, const char* tpl,
+    uv_fs_cb cb) {
   int err;
 
-  INIT(UV_FS_MKDTEMP);
-  err = fs__capture_path(req, tpl, NULL, TRUE);
+  uv_fs_req_init(loop, req, UV_FS_MKDTEMP, cb);
+
+  err = fs__capture_path(loop, req, tpl, NULL, TRUE);
   if (err)
     return uv_translate_sys_error(err);
 
-  POST;
-}
-
-
-int uv_fs_mkstemp(uv_loop_t* loop,
-                  uv_fs_t* req,
-                  const char* tpl,
-                  uv_fs_cb cb) {
-  int err;
-
-  INIT(UV_FS_MKSTEMP);
-  err = fs__capture_path(req, tpl, NULL, TRUE);
-  if (err)
-    return uv_translate_sys_error(err);
-
-  POST;
+  if (cb) {
+    QUEUE_FS_TP_JOB(loop, req);
+    return 0;
+  } else {
+    fs__mkdtemp(req);
+    return req->result;
+  }
 }
 
 
 int uv_fs_rmdir(uv_loop_t* loop, uv_fs_t* req, const char* path, uv_fs_cb cb) {
   int err;
 
-  INIT(UV_FS_RMDIR);
-  err = fs__capture_path(req, path, NULL, cb != NULL);
+  uv_fs_req_init(loop, req, UV_FS_RMDIR, cb);
+
+  err = fs__capture_path(loop, req, path, NULL, cb != NULL);
   if (err) {
     return uv_translate_sys_error(err);
   }
 
-  POST;
+  if (cb) {
+    QUEUE_FS_TP_JOB(loop, req);
+    return 0;
+  } else {
+    fs__rmdir(req);
+    return req->result;
+  }
 }
 
 
@@ -2903,67 +1948,43 @@ int uv_fs_scandir(uv_loop_t* loop, uv_fs_t* req, const char* path, int flags,
     uv_fs_cb cb) {
   int err;
 
-  INIT(UV_FS_SCANDIR);
-  err = fs__capture_path(req, path, NULL, cb != NULL);
+  uv_fs_req_init(loop, req, UV_FS_SCANDIR, cb);
+
+  err = fs__capture_path(loop, req, path, NULL, cb != NULL);
   if (err) {
     return uv_translate_sys_error(err);
   }
 
-  req->fs.info.file_flags = flags;
-  POST;
-}
+  req->file_flags = flags;
 
-int uv_fs_opendir(uv_loop_t* loop,
-                  uv_fs_t* req,
-                  const char* path,
-                  uv_fs_cb cb) {
-  int err;
-
-  INIT(UV_FS_OPENDIR);
-  err = fs__capture_path(req, path, NULL, cb != NULL);
-  if (err)
-    return uv_translate_sys_error(err);
-  POST;
-}
-
-int uv_fs_readdir(uv_loop_t* loop,
-                  uv_fs_t* req,
-                  uv_dir_t* dir,
-                  uv_fs_cb cb) {
-  INIT(UV_FS_READDIR);
-
-  if (dir == NULL ||
-      dir->dirents == NULL ||
-      dir->dir_handle == INVALID_HANDLE_VALUE) {
-    return UV_EINVAL;
+  if (cb) {
+    QUEUE_FS_TP_JOB(loop, req);
+    return 0;
+  } else {
+    fs__scandir(req);
+    return req->result;
   }
-
-  req->ptr = dir;
-  POST;
 }
 
-int uv_fs_closedir(uv_loop_t* loop,
-                   uv_fs_t* req,
-                   uv_dir_t* dir,
-                   uv_fs_cb cb) {
-  INIT(UV_FS_CLOSEDIR);
-  if (dir == NULL)
-    return UV_EINVAL;
-  req->ptr = dir;
-  POST;
-}
 
 int uv_fs_link(uv_loop_t* loop, uv_fs_t* req, const char* path,
     const char* new_path, uv_fs_cb cb) {
   int err;
 
-  INIT(UV_FS_LINK);
-  err = fs__capture_path(req, path, new_path, cb != NULL);
+  uv_fs_req_init(loop, req, UV_FS_LINK, cb);
+
+  err = fs__capture_path(loop, req, path, new_path, cb != NULL);
   if (err) {
     return uv_translate_sys_error(err);
   }
 
-  POST;
+  if (cb) {
+    QUEUE_FS_TP_JOB(loop, req);
+    return 0;
+  } else {
+    fs__link(req);
+    return req->result;
+  }
 }
 
 
@@ -2971,14 +1992,22 @@ int uv_fs_symlink(uv_loop_t* loop, uv_fs_t* req, const char* path,
     const char* new_path, int flags, uv_fs_cb cb) {
   int err;
 
-  INIT(UV_FS_SYMLINK);
-  err = fs__capture_path(req, path, new_path, cb != NULL);
+  uv_fs_req_init(loop, req, UV_FS_SYMLINK, cb);
+
+  err = fs__capture_path(loop, req, path, new_path, cb != NULL);
   if (err) {
     return uv_translate_sys_error(err);
   }
 
-  req->fs.info.file_flags = flags;
-  POST;
+  req->file_flags = flags;
+
+  if (cb) {
+    QUEUE_FS_TP_JOB(loop, req);
+    return 0;
+  } else {
+    fs__symlink(req);
+    return req->result;
+  }
 }
 
 
@@ -2986,32 +2015,20 @@ int uv_fs_readlink(uv_loop_t* loop, uv_fs_t* req, const char* path,
     uv_fs_cb cb) {
   int err;
 
-  INIT(UV_FS_READLINK);
-  err = fs__capture_path(req, path, NULL, cb != NULL);
+  uv_fs_req_init(loop, req, UV_FS_READLINK, cb);
+
+  err = fs__capture_path(loop, req, path, NULL, cb != NULL);
   if (err) {
     return uv_translate_sys_error(err);
   }
 
-  POST;
-}
-
-
-int uv_fs_realpath(uv_loop_t* loop, uv_fs_t* req, const char* path,
-    uv_fs_cb cb) {
-  int err;
-
-  INIT(UV_FS_REALPATH);
-
-  if (!path) {
-    return UV_EINVAL;
+  if (cb) {
+    QUEUE_FS_TP_JOB(loop, req);
+    return 0;
+  } else {
+    fs__readlink(req);
+    return req->result;
   }
-
-  err = fs__capture_path(req, path, NULL, cb != NULL);
-  if (err) {
-    return uv_translate_sys_error(err);
-  }
-
-  POST;
 }
 
 
@@ -3019,66 +2036,88 @@ int uv_fs_chown(uv_loop_t* loop, uv_fs_t* req, const char* path, uv_uid_t uid,
     uv_gid_t gid, uv_fs_cb cb) {
   int err;
 
-  INIT(UV_FS_CHOWN);
-  err = fs__capture_path(req, path, NULL, cb != NULL);
+  uv_fs_req_init(loop, req, UV_FS_CHOWN, cb);
+
+  err = fs__capture_path(loop, req, path, NULL, cb != NULL);
   if (err) {
     return uv_translate_sys_error(err);
   }
 
-  POST;
+  if (cb) {
+    QUEUE_FS_TP_JOB(loop, req);
+    return 0;
+  } else {
+    fs__chown(req);
+    return req->result;
+  }
 }
 
 
 int uv_fs_fchown(uv_loop_t* loop, uv_fs_t* req, uv_file fd, uv_uid_t uid,
     uv_gid_t gid, uv_fs_cb cb) {
-  INIT(UV_FS_FCHOWN);
-  POST;
-}
+  uv_fs_req_init(loop, req, UV_FS_FCHOWN, cb);
 
-
-int uv_fs_lchown(uv_loop_t* loop, uv_fs_t* req, const char* path, uv_uid_t uid,
-    uv_gid_t gid, uv_fs_cb cb) {
-  int err;
-
-  INIT(UV_FS_LCHOWN);
-  err = fs__capture_path(req, path, NULL, cb != NULL);
-  if (err) {
-    return uv_translate_sys_error(err);
+  if (cb) {
+    QUEUE_FS_TP_JOB(loop, req);
+    return 0;
+  } else {
+    fs__fchown(req);
+    return req->result;
   }
-  POST;
 }
 
 
 int uv_fs_stat(uv_loop_t* loop, uv_fs_t* req, const char* path, uv_fs_cb cb) {
   int err;
 
-  INIT(UV_FS_STAT);
-  err = fs__capture_path(req, path, NULL, cb != NULL);
+  uv_fs_req_init(loop, req, UV_FS_STAT, cb);
+
+  err = fs__capture_path(loop, req, path, NULL, cb != NULL);
   if (err) {
     return uv_translate_sys_error(err);
   }
 
-  POST;
+  if (cb) {
+    QUEUE_FS_TP_JOB(loop, req);
+    return 0;
+  } else {
+    fs__stat(req);
+    return req->result;
+  }
 }
 
 
 int uv_fs_lstat(uv_loop_t* loop, uv_fs_t* req, const char* path, uv_fs_cb cb) {
   int err;
 
-  INIT(UV_FS_LSTAT);
-  err = fs__capture_path(req, path, NULL, cb != NULL);
+  uv_fs_req_init(loop, req, UV_FS_LSTAT, cb);
+
+  err = fs__capture_path(loop, req, path, NULL, cb != NULL);
   if (err) {
     return uv_translate_sys_error(err);
   }
 
-  POST;
+  if (cb) {
+    QUEUE_FS_TP_JOB(loop, req);
+    return 0;
+  } else {
+    fs__lstat(req);
+    return req->result;
+  }
 }
 
 
 int uv_fs_fstat(uv_loop_t* loop, uv_fs_t* req, uv_file fd, uv_fs_cb cb) {
-  INIT(UV_FS_FSTAT);
-  req->file.fd = fd;
-  POST;
+  uv_fs_req_init(loop, req, UV_FS_FSTAT, cb);
+  req->fd = fd;
+
+  if (cb) {
+    QUEUE_FS_TP_JOB(loop, req);
+    return 0;
+  } else {
+    fs__fstat(req);
+    return req->result;
+  }
 }
 
 
@@ -3086,73 +2125,85 @@ int uv_fs_rename(uv_loop_t* loop, uv_fs_t* req, const char* path,
     const char* new_path, uv_fs_cb cb) {
   int err;
 
-  INIT(UV_FS_RENAME);
-  err = fs__capture_path(req, path, new_path, cb != NULL);
+  uv_fs_req_init(loop, req, UV_FS_RENAME, cb);
+
+  err = fs__capture_path(loop, req, path, new_path, cb != NULL);
   if (err) {
     return uv_translate_sys_error(err);
   }
 
-  POST;
+  if (cb) {
+    QUEUE_FS_TP_JOB(loop, req);
+    return 0;
+  } else {
+    fs__rename(req);
+    return req->result;
+  }
 }
 
 
 int uv_fs_fsync(uv_loop_t* loop, uv_fs_t* req, uv_file fd, uv_fs_cb cb) {
-  INIT(UV_FS_FSYNC);
-  req->file.fd = fd;
-  POST;
+  uv_fs_req_init(loop, req, UV_FS_FSYNC, cb);
+  req->fd = fd;
+
+  if (cb) {
+    QUEUE_FS_TP_JOB(loop, req);
+    return 0;
+  } else {
+    fs__fsync(req);
+    return req->result;
+  }
 }
 
 
 int uv_fs_fdatasync(uv_loop_t* loop, uv_fs_t* req, uv_file fd, uv_fs_cb cb) {
-  INIT(UV_FS_FDATASYNC);
-  req->file.fd = fd;
-  POST;
+  uv_fs_req_init(loop, req, UV_FS_FDATASYNC, cb);
+  req->fd = fd;
+
+  if (cb) {
+    QUEUE_FS_TP_JOB(loop, req);
+    return 0;
+  } else {
+    fs__fdatasync(req);
+    return req->result;
+  }
 }
 
 
 int uv_fs_ftruncate(uv_loop_t* loop, uv_fs_t* req, uv_file fd,
     int64_t offset, uv_fs_cb cb) {
-  INIT(UV_FS_FTRUNCATE);
-  req->file.fd = fd;
-  req->fs.info.offset = offset;
-  POST;
-}
+  uv_fs_req_init(loop, req, UV_FS_FTRUNCATE, cb);
 
+  req->fd = fd;
+  req->offset = offset;
 
-int uv_fs_copyfile(uv_loop_t* loop,
-                   uv_fs_t* req,
-                   const char* path,
-                   const char* new_path,
-                   int flags,
-                   uv_fs_cb cb) {
-  int err;
-
-  INIT(UV_FS_COPYFILE);
-
-  if (flags & ~(UV_FS_COPYFILE_EXCL |
-                UV_FS_COPYFILE_FICLONE |
-                UV_FS_COPYFILE_FICLONE_FORCE)) {
-    return UV_EINVAL;
+  if (cb) {
+    QUEUE_FS_TP_JOB(loop, req);
+    return 0;
+  } else {
+    fs__ftruncate(req);
+    return req->result;
   }
-
-  err = fs__capture_path(req, path, new_path, cb != NULL);
-
-  if (err)
-    return uv_translate_sys_error(err);
-
-  req->fs.info.file_flags = flags;
-  POST;
 }
+
 
 
 int uv_fs_sendfile(uv_loop_t* loop, uv_fs_t* req, uv_file fd_out,
     uv_file fd_in, int64_t in_offset, size_t length, uv_fs_cb cb) {
-  INIT(UV_FS_SENDFILE);
-  req->file.fd = fd_in;
-  req->fs.info.fd_out = fd_out;
-  req->fs.info.offset = in_offset;
-  req->fs.info.bufsml[0].len = length;
-  POST;
+  uv_fs_req_init(loop, req, UV_FS_SENDFILE, cb);
+
+  req->fd = fd_in;
+  req->fd_out = fd_out;
+  req->offset = in_offset;
+  req->bufsml[0].len = length;
+
+  if (cb) {
+    QUEUE_FS_TP_JOB(loop, req);
+    return 0;
+  } else {
+    fs__sendfile(req);
+    return req->result;
+  }
 }
 
 
@@ -3163,13 +2214,21 @@ int uv_fs_access(uv_loop_t* loop,
                  uv_fs_cb cb) {
   int err;
 
-  INIT(UV_FS_ACCESS);
-  err = fs__capture_path(req, path, NULL, cb != NULL);
+  uv_fs_req_init(loop, req, UV_FS_ACCESS, cb);
+
+  err = fs__capture_path(loop, req, path, NULL, cb != NULL);
   if (err)
     return uv_translate_sys_error(err);
 
-  req->fs.info.mode = flags;
-  POST;
+  req->flags = flags;
+
+  if (cb) {
+    QUEUE_FS_TP_JOB(loop, req);
+    return 0;
+  }
+
+  fs__access(req);
+  return req->result;
 }
 
 
@@ -3177,23 +2236,39 @@ int uv_fs_chmod(uv_loop_t* loop, uv_fs_t* req, const char* path, int mode,
     uv_fs_cb cb) {
   int err;
 
-  INIT(UV_FS_CHMOD);
-  err = fs__capture_path(req, path, NULL, cb != NULL);
+  uv_fs_req_init(loop, req, UV_FS_CHMOD, cb);
+
+  err = fs__capture_path(loop, req, path, NULL, cb != NULL);
   if (err) {
     return uv_translate_sys_error(err);
   }
 
-  req->fs.info.mode = mode;
-  POST;
+  req->mode = mode;
+
+  if (cb) {
+    QUEUE_FS_TP_JOB(loop, req);
+    return 0;
+  } else {
+    fs__chmod(req);
+    return req->result;
+  }
 }
 
 
 int uv_fs_fchmod(uv_loop_t* loop, uv_fs_t* req, uv_file fd, int mode,
     uv_fs_cb cb) {
-  INIT(UV_FS_FCHMOD);
-  req->file.fd = fd;
-  req->fs.info.mode = mode;
-  POST;
+  uv_fs_req_init(loop, req, UV_FS_FCHMOD, cb);
+
+  req->fd = fd;
+  req->mode = mode;
+
+  if (cb) {
+    QUEUE_FS_TP_JOB(loop, req);
+    return 0;
+  } else {
+    fs__fchmod(req);
+    return req->result;
+  }
 }
 
 
@@ -3201,38 +2276,39 @@ int uv_fs_utime(uv_loop_t* loop, uv_fs_t* req, const char* path, double atime,
     double mtime, uv_fs_cb cb) {
   int err;
 
-  INIT(UV_FS_UTIME);
-  err = fs__capture_path(req, path, NULL, cb != NULL);
+  uv_fs_req_init(loop, req, UV_FS_UTIME, cb);
+
+  err = fs__capture_path(loop, req, path, NULL, cb != NULL);
   if (err) {
     return uv_translate_sys_error(err);
   }
 
-  req->fs.time.atime = atime;
-  req->fs.time.mtime = mtime;
-  POST;
+  req->atime = atime;
+  req->mtime = mtime;
+
+  if (cb) {
+    QUEUE_FS_TP_JOB(loop, req);
+    return 0;
+  } else {
+    fs__utime(req);
+    return req->result;
+  }
 }
 
 
 int uv_fs_futime(uv_loop_t* loop, uv_fs_t* req, uv_file fd, double atime,
     double mtime, uv_fs_cb cb) {
-  INIT(UV_FS_FUTIME);
-  req->file.fd = fd;
-  req->fs.time.atime = atime;
-  req->fs.time.mtime = mtime;
-  POST;
-}
+  uv_fs_req_init(loop, req, UV_FS_FUTIME, cb);
 
+  req->fd = fd;
+  req->atime = atime;
+  req->mtime = mtime;
 
-int uv_fs_statfs(uv_loop_t* loop,
-                 uv_fs_t* req,
-                 const char* path,
-                 uv_fs_cb cb) {
-  int err;
-
-  INIT(UV_FS_STATFS);
-  err = fs__capture_path(req, path, NULL, cb != NULL);
-  if (err)
-    return uv_translate_sys_error(err);
-
-  POST;
+  if (cb) {
+    QUEUE_FS_TP_JOB(loop, req);
+    return 0;
+  } else {
+    fs__futime(req);
+    return req->result;
+  }
 }

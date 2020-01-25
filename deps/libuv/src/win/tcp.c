@@ -118,12 +118,14 @@ static int uv_tcp_set_socket(uv_loop_t* loop,
     non_ifs_lsp = uv_tcp_non_ifs_lsp_ipv4;
   }
 
-  if (!(handle->flags & UV_HANDLE_EMULATE_IOCP) && !non_ifs_lsp) {
-    UCHAR sfcnm_flags =
-        FILE_SKIP_SET_EVENT_ON_HANDLE | FILE_SKIP_COMPLETION_PORT_ON_SUCCESS;
-    if (!SetFileCompletionNotificationModes((HANDLE) socket, sfcnm_flags))
-      return GetLastError();
-    handle->flags |= UV_HANDLE_SYNC_BYPASS_IOCP;
+  if (pSetFileCompletionNotificationModes) {
+    if (!(handle->flags & UV_HANDLE_EMULATE_IOCP) && !non_ifs_lsp) {
+      UCHAR sfcnm_flags =
+          FILE_SKIP_SET_EVENT_ON_HANDLE | FILE_SKIP_COMPLETION_PORT_ON_SUCCESS;
+      if (!pSetFileCompletionNotificationModes((HANDLE) socket, sfcnm_flags))
+        return GetLastError();
+      handle->flags |= UV_HANDLE_SYNC_BYPASS_IOCP;
+    }
   }
 
   if (handle->flags & UV_HANDLE_TCP_NODELAY) {

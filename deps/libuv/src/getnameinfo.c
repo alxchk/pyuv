@@ -25,7 +25,12 @@
 #include <string.h>
 
 #include "uv.h"
-#include "internal.h"
+
+#ifdef WIN32
+#include "win/internal.h"
+#else
+#include "unix/internal.h"
+#endif
 
 
 static void uv__getnameinfo_work(struct uv__work* w) {

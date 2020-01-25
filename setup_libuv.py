@@ -6,6 +6,8 @@ from distutils.command.build_ext import build_ext
 
 
 SOURCES = [
+    'deps/libuv/src/getaddrinfo.c',
+    'deps/libuv/src/getnameinfo.c',
     'deps/libuv/src/fs-poll.c',
     'deps/libuv/src/inet.c',
     'deps/libuv/src/threadpool.c',
@@ -13,7 +15,7 @@ SOURCES = [
     'deps/libuv/src/version.c',
     'deps/libuv/src/strscpy.c',
     'deps/libuv/src/timer.c',
-    'deps/libuv/src/idna.c',
+    'deps/libuv/src/idna.c'
 ]
 
 if sys.platform == 'win32':
@@ -25,8 +27,6 @@ if sys.platform == 'win32':
         'deps/libuv/src/win/error.c',
         'deps/libuv/src/win/fs-event.c',
         'deps/libuv/src/win/fs.c',
-        'deps/libuv/src/win/getaddrinfo.c',
-        'deps/libuv/src/win/getnameinfo.c',
         'deps/libuv/src/win/handle.c',
         'deps/libuv/src/win/loop-watcher.c',
         'deps/libuv/src/win/pipe.c',
@@ -50,8 +50,6 @@ else:
         'deps/libuv/src/unix/core.c',
         'deps/libuv/src/unix/dl.c',
         'deps/libuv/src/unix/fs.c',
-        'deps/libuv/src/unix/getaddrinfo.c',
-        'deps/libuv/src/unix/getnameinfo.c',
         'deps/libuv/src/unix/loop-watcher.c',
         'deps/libuv/src/unix/loop.c',
         'deps/libuv/src/unix/pipe.c',

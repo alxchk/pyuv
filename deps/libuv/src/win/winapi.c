@@ -41,6 +41,23 @@ sRtlGenRandom pRtlGenRandom;
 
 /* Kernel32 function pointers */
 sGetQueuedCompletionStatusEx pGetQueuedCompletionStatusEx;
+sSetFileCompletionNotificationModes pSetFileCompletionNotificationModes;
+sCreateSymbolicLinkW pCreateSymbolicLinkW;
+sCancelIoEx pCancelIoEx;
+sInitializeSRWLock pInitializeSRWLock;
+sAcquireSRWLockShared pAcquireSRWLockShared;
+sAcquireSRWLockExclusive pAcquireSRWLockExclusive;
+sTryAcquireSRWLockShared pTryAcquireSRWLockShared;
+sTryAcquireSRWLockExclusive pTryAcquireSRWLockExclusive;
+sReleaseSRWLockShared pReleaseSRWLockShared;
+sReleaseSRWLockExclusive pReleaseSRWLockExclusive;
+sInitializeConditionVariable pInitializeConditionVariable;
+sSleepConditionVariableCS pSleepConditionVariableCS;
+sSleepConditionVariableSRW pSleepConditionVariableSRW;
+sWakeAllConditionVariable pWakeAllConditionVariable;
+sWakeConditionVariable pWakeConditionVariable;
+sCancelSynchronousIo pCancelSynchronousIo;
+
 
 /* Powrprof.dll function pointer */
 sPowerRegisterSuspendResumeNotification pPowerRegisterSuspendResumeNotification;
@@ -126,6 +143,55 @@ void uv_winapi_init(void) {
   pGetQueuedCompletionStatusEx = (sGetQueuedCompletionStatusEx) GetProcAddress(
       kernel32_module,
       "GetQueuedCompletionStatusEx");
+
+  pSetFileCompletionNotificationModes = (sSetFileCompletionNotificationModes)
+    GetProcAddress(kernel32_module, "SetFileCompletionNotificationModes");
+
+  pCreateSymbolicLinkW = (sCreateSymbolicLinkW)
+    GetProcAddress(kernel32_module, "CreateSymbolicLinkW");
+
+  pCancelIoEx = (sCancelIoEx)
+    GetProcAddress(kernel32_module, "CancelIoEx");
+
+  pInitializeSRWLock = (sInitializeSRWLock)
+    GetProcAddress(kernel32_module, "InitializeSRWLock");
+
+  pAcquireSRWLockShared = (sAcquireSRWLockShared)
+    GetProcAddress(kernel32_module, "AcquireSRWLockShared");
+
+  pAcquireSRWLockExclusive = (sAcquireSRWLockExclusive)
+    GetProcAddress(kernel32_module, "AcquireSRWLockExclusive");
+
+  pTryAcquireSRWLockShared = (sTryAcquireSRWLockShared)
+    GetProcAddress(kernel32_module, "TryAcquireSRWLockShared");
+
+  pTryAcquireSRWLockExclusive = (sTryAcquireSRWLockExclusive)
+    GetProcAddress(kernel32_module, "TryAcquireSRWLockExclusive");
+
+  pReleaseSRWLockShared = (sReleaseSRWLockShared)
+    GetProcAddress(kernel32_module, "ReleaseSRWLockShared");
+
+  pReleaseSRWLockExclusive = (sReleaseSRWLockExclusive)
+    GetProcAddress(kernel32_module, "ReleaseSRWLockExclusive");
+
+  pInitializeConditionVariable = (sInitializeConditionVariable)
+    GetProcAddress(kernel32_module, "InitializeConditionVariable");
+
+  pSleepConditionVariableCS = (sSleepConditionVariableCS)
+    GetProcAddress(kernel32_module, "SleepConditionVariableCS");
+
+  pSleepConditionVariableSRW = (sSleepConditionVariableSRW)
+    GetProcAddress(kernel32_module, "SleepConditionVariableSRW");
+
+  pWakeAllConditionVariable = (sWakeAllConditionVariable)
+    GetProcAddress(kernel32_module, "WakeAllConditionVariable");
+
+  pWakeConditionVariable = (sWakeConditionVariable)
+    GetProcAddress(kernel32_module, "WakeConditionVariable");
+
+  pCancelSynchronousIo = (sCancelSynchronousIo)
+    GetProcAddress(kernel32_module, "CancelSynchronousIo");
+
 
   powrprof_module = LoadLibraryA("powrprof.dll");
   if (powrprof_module != NULL) {

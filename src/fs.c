@@ -1484,6 +1484,7 @@ FS_func_access(PyObject *obj, PyObject *args, PyObject *kwargs)
 }
 
 
+#ifndef _WIN32
 static PyObject *
 FS_func_realpath(PyObject *obj, PyObject *args, PyObject *kwargs)
 {
@@ -1532,7 +1533,7 @@ FS_func_realpath(PyObject *obj, PyObject *args, PyObject *kwargs)
         return ret;
     }
 }
-
+#endif
 
 static PyMethodDef
 FS_methods[] = {
@@ -1562,7 +1563,9 @@ FS_methods[] = {
     { "utime", (PyCFunction)FS_func_utime, METH_VARARGS|METH_KEYWORDS, "Update file times." },
     { "futime", (PyCFunction)FS_func_futime, METH_VARARGS|METH_KEYWORDS, "Update file times." },
     { "access", (PyCFunction)FS_func_access, METH_VARARGS|METH_KEYWORDS, "Check access to file." },
+#ifndef _WIN32
     { "realpath", (PyCFunction)FS_func_realpath, METH_VARARGS|METH_KEYWORDS, "Returns the canonicalized absolute path." },
+#endif
     { "stat_float_times", (PyCFunction)stat_float_times, METH_VARARGS, "Use floats for times in stat structs." },
     { NULL }
 };

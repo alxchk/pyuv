@@ -4672,6 +4672,65 @@ typedef BOOL (WINAPI *sGetQueuedCompletionStatusEx)
               DWORD dwMilliseconds,
               BOOL fAlertable);
 
+typedef BOOL (WINAPI* sSetFileCompletionNotificationModes)
+             (HANDLE FileHandle,
+              UCHAR Flags);
+
+typedef BOOLEAN (WINAPI* sCreateSymbolicLinkW)
+                (LPCWSTR lpSymlinkFileName,
+                 LPCWSTR lpTargetFileName,
+                 DWORD dwFlags);
+
+typedef BOOL (WINAPI* sCancelIoEx)
+             (HANDLE hFile,
+              LPOVERLAPPED lpOverlapped);
+
+typedef VOID (WINAPI* sInitializeSRWLock)
+             (PSRWLOCK SRWLock);
+
+typedef VOID (WINAPI* sAcquireSRWLockShared)
+             (PSRWLOCK SRWLock);
+
+typedef VOID (WINAPI* sAcquireSRWLockExclusive)
+             (PSRWLOCK SRWLock);
+
+typedef BOOL (WINAPI* sTryAcquireSRWLockShared)
+             (PSRWLOCK SRWLock);
+
+typedef BOOL (WINAPI* sTryAcquireSRWLockExclusive)
+             (PSRWLOCK SRWLock);
+
+typedef VOID (WINAPI* sReleaseSRWLockShared)
+             (PSRWLOCK SRWLock);
+
+typedef VOID (WINAPI* sReleaseSRWLockExclusive)
+             (PSRWLOCK SRWLock);
+
+typedef VOID (WINAPI* sInitializeConditionVariable)
+             (PCONDITION_VARIABLE ConditionVariable);
+
+typedef BOOL (WINAPI* sSleepConditionVariableCS)
+             (PCONDITION_VARIABLE ConditionVariable,
+              PCRITICAL_SECTION CriticalSection,
+              DWORD dwMilliseconds);
+
+typedef BOOL (WINAPI* sSleepConditionVariableSRW)
+             (PCONDITION_VARIABLE ConditionVariable,
+              PSRWLOCK SRWLock,
+              DWORD dwMilliseconds,
+              ULONG Flags);
+
+typedef VOID (WINAPI* sWakeAllConditionVariable)
+             (PCONDITION_VARIABLE ConditionVariable);
+
+typedef VOID (WINAPI* sWakeConditionVariable)
+             (PCONDITION_VARIABLE ConditionVariable);
+
+typedef BOOL (WINAPI* sCancelSynchronousIo)
+             (HANDLE hThread);
+
+
+
 /* from powerbase.h */
 #ifndef DEVICE_NOTIFY_CALLBACK
 # define DEVICE_NOTIFY_CALLBACK 2
@@ -4741,6 +4800,22 @@ extern sRtlGenRandom pRtlGenRandom;
 
 /* Kernel32 function pointers */
 extern sGetQueuedCompletionStatusEx pGetQueuedCompletionStatusEx;
+extern sSetFileCompletionNotificationModes pSetFileCompletionNotificationModes;
+extern sCreateSymbolicLinkW pCreateSymbolicLinkW;
+extern sCancelIoEx pCancelIoEx;
+extern sInitializeSRWLock pInitializeSRWLock;
+extern sAcquireSRWLockShared pAcquireSRWLockShared;
+extern sAcquireSRWLockExclusive pAcquireSRWLockExclusive;
+extern sTryAcquireSRWLockShared pTryAcquireSRWLockShared;
+extern sTryAcquireSRWLockExclusive pTryAcquireSRWLockExclusive;
+extern sReleaseSRWLockShared pReleaseSRWLockShared;
+extern sReleaseSRWLockExclusive pReleaseSRWLockExclusive;
+extern sInitializeConditionVariable pInitializeConditionVariable;
+extern sSleepConditionVariableCS pSleepConditionVariableCS;
+extern sSleepConditionVariableSRW pSleepConditionVariableSRW;
+extern sWakeAllConditionVariable pWakeAllConditionVariable;
+extern sWakeConditionVariable pWakeConditionVariable;
+extern sCancelSynchronousIo pCancelSynchronousIo;
 
 /* Powrprof.dll function pointer */
 extern sPowerRegisterSuspendResumeNotification pPowerRegisterSuspendResumeNotification;
