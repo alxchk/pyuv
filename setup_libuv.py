@@ -141,6 +141,7 @@ class libuv_build_ext(build_ext):
         if sys.platform.startswith('linux'):
             self.compiler.add_library('dl')
             self.compiler.add_library('rt')
+            self.compiler.add_library('pthread')
 
             self.compiler.add_include_dir(
                 os.path.join(self.libuv_dir, 'compat', 'linux'))

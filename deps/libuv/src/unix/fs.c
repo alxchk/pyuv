@@ -35,6 +35,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <limits.h> /* PATH_MAX */
+#include <syscall.h>
 
 #include <sys/types.h>
 #include <sys/socket.h>
@@ -206,7 +207,7 @@ static ssize_t uv__fs_fdatasync(uv_fs_t* req) {
 
 
 static ssize_t uv__fs_futime(uv_fs_t* req) {
-#if defined(__linux__)                                                        \
+#if (defined(__linux__) && defined(__NR_utimensat)) \
     || defined(_AIX71)                                                        \
     || defined(__HAIKU__)
   /* utimesat() has nanosecond resolution but we stick to microseconds
